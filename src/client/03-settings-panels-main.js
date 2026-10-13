@@ -446,11 +446,12 @@
             el('label', null, t('peakStyleLabel')),
             el('select', {
               className: 'cm-input',
-              value: draft?.peakStyle === 'classic' ? 'classic' : 'compact',
+              value: draft?.peakStyle === 'classic' || draft?.peakStyle === 'dynamic' ? draft.peakStyle : 'compact',
               onChange: event => setField('peakStyle', event.target.value),
             },
               el('option', { value: 'compact' }, t('peakStyleCompact')),
-              el('option', { value: 'classic' }, t('peakStyleClassic'))))),
+              el('option', { value: 'classic' }, t('peakStyleClassic')),
+              el('option', { value: 'dynamic' }, t('peakStyleDynamic'))))),
         el('div', { className: 'cm-grid' },
           el('div', { className: 'cm-field' },
             el('label', { className: 'cm-check' },
@@ -2866,6 +2867,8 @@
       ctx.on('slots/changed', contextPrices)
       ;['conversation.view', 'sidebar.right.pane.tab', 'conversation.input.overlay'].forEach(contextPrices)
 
+      // 动态峰谷样式按需加载:把分块加载器交给客户端片段(主包不内联该样式)。
+      peakLoad = () => require.async('./client.peak.js')
       const injected = () => ({ hooks: { cost: store }, api })
       for (const [entryPosition, name] of [['header', 'conversation.session.header.actions'], ['dock', 'conversation.composer.dock']]) slots.inject(name, () => slots.register({ name, id: 'cost-meter-statistics', order: 1, inject: () => ({ ...injected(), entryPosition }) }, SessionStatisticsButton))
       slots.inject('conversation.chat.turnTail', () => slots.register({ name: 'conversation.chat.turnTail', id: 'cost-meter-turn', order: 10, inject: injected }, TurnCost))

@@ -137,14 +137,23 @@ writeFileSync(outPath, header + result.code)
 const bytes = Buffer.byteLength(header + result.code, 'utf8')
 console.log(`src/client/*.js (${fragments.length} fragments) -> lib/client.js ${bytes} bytes`)
 if (bytes > 262144) {
-  console.error(`✗ lib/client.js still exceeds 262144 bytes (${bytes})`)
-  process.exit(1)
+  // 本地开发逃生口(CM_ALLOW_OVERSIZE=1):仍写出 lib/client.js 以便在链接安装的
+  // 实例里预览效果,但明确报告超限;发布/CI 不得设置该变量(门禁照旧失败)。
+  if (process.env.CM_ALLOW_OVERSIZE === '1') {
+    console.warn(`⚠ lib/client.js exceeds 262144 bytes (${bytes}); CM_ALLOW_OVERSIZE=1 → 仅本地预览,禁止发布`)
+  } else {
+    console.error(`✗ lib/client.js still exceeds 262144 bytes (${bytes})`)
+    process.exit(1)
+  }
+} else {
+  console.log('✓ lib/client.js within DSH STORE per-file bound (262144)')
 }
-console.log('✓ lib/client.js within DSH STORE per-file bound (262144)')
 
 // DSH 0.2.0-rc.2 package-local chunks use the host's require.async contract.
 // Each on-demand screen has readable source and a bounded runtime asset.
-for (const chunk of ['statistics', 'openrouter']) {
+// 主客户端贴着 256 KiB 上限,新增的「动态」峰谷样式整体放在 peak 分块里,
+// 只在用户选中该样式时加载(<10 KiB),主包字节零增量。
+for (const chunk of ['statistics', 'openrouter', 'peak']) {
   const source = readFileSync(resolve(projectRoot, `src/${chunk}/index.js`), 'utf8')
   const result = await transform(source, { minify: true, target: 'es2022', charset: 'utf8', legalComments: 'none' })
   for (const [name, text] of [[`src/${chunk}/index.js`, source], [`lib/client.${chunk}.js`, result.code]]) {

@@ -2015,6 +2015,14 @@
         : { short: 'offPeakShort', chip: 'offPeakShort', notice: 'offPeakActive' }
     }
 
+    /**
+     * 「动态」峰谷样式:整块渲染与样式表放在按需分块 lib/client.peak.js 里(主包贴着
+     * 256 KiB 上限)。激活层把加载器注入 peakLoad;选中该样式时加载一次,未就绪与
+     * 加载失败时不渲染该行,其余峰谷样式的行为不变。
+     */
+    let peakLoad = null // 分块加载器:激活层注入;未注入时动态样式退回简洁样式
+    let peakChunk = null // 请求期间:Promise;就绪后:组件;失败:回到 null(可重试)
+
     /** 倒计时文本(距下次相位切换,向上取整到分钟)。 */
     function countdownText(view, now, t) {
       const duration = Math.max(0, view.nextAtMs - now)
@@ -2183,7 +2191,9 @@
           el('span', { className: 'cm-peak-classic-chip' }, t(keys.chip) + ' · ' + chipText)))
     }
     function peakNoticeEl(state, config, t) {
-      return el(config?.peakStyle === 'classic' ? PeakStripClassic : PeakStrip, { config, t })
+      if (config?.peakStyle === 'classic') return el(PeakStripClassic, { config, t })
+      if (config?.peakStyle === 'dynamic' && peakLoad !== null) return el(PeakLazy, { config, t })
+      return el(PeakStrip, { config, t })
     }
 
     /** 收起(rail)态简洁样式:竖向同构时段条 + 横排短词(「峰时/平价」),倒计时与完整文案在悬停提示中。 */
@@ -2233,8 +2243,27 @@
             el('div', { className: 'cm-peak-rail-classic-marker', style: { top: view.weekend || view.holiday ? '50%' : view.inPeak ? '25%' : '75%' } })),
           el('span', { className: 'cm-peak-rail-classic-label' }, t(keys.short))))
     }
+    /**
+     * 动态样式外壳:首次渲染即发起分块请求(幂等,只请求一次)。peakChunk 在请求
+     * 期间保存 Promise,resolve 后保存组件;两者必须区分——把 Promise 当元素类型
+     * 交给 React 会直接抛 "Element type is invalid" 并把整页打白。
+     * 未就绪与加载失败时不渲染这一行;resolve 后主动 bump 一次,让图框立刻换成
+     * 动态样式(不依赖 30 秒心跳或配置轮询)。分块自行维持时刻心跳,主包不传时刻。
+     */
+    function PeakLazy(props) {
+      const [, bump] = useState(0)
+      if (peakChunk === null) {
+        peakChunk = peakLoad()
+        peakChunk.then(mod => { peakChunk = mod.mount(); bump(1) }, () => { peakChunk = null })
+      }
+      if (typeof peakChunk.then === 'function') return null
+      return el(peakChunk, props)
+    }
+
     function peakNoticeRailEl(state, config, t) {
-      return el(config?.peakStyle === 'classic' ? PeakRailStripClassic : PeakRailStrip, { config, t })
+      if (config?.peakStyle === 'classic') return el(PeakRailStripClassic, { config, t })
+      if (config?.peakStyle === 'dynamic' && peakLoad !== null) return el(PeakLazy, { config, t, rail: true })
+      return el(PeakRailStrip, { config, t })
     }
 
     /** 预算图框内容(不含外框),供单独显示与「Go+预算」合并卡片复用;详细信息按 budget.detail 开关。 */

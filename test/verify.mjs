@@ -8,6 +8,7 @@ import './ledger-concurrency.mjs'
 import './ledger-lock-recovery.mjs'
 import './external-usage.mjs'
 import './context-costs.mjs'
+import './peak-dynamic-style.mjs'
 import { readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join, dirname, resolve } from 'node:path'
@@ -733,10 +734,19 @@ assert.equal(patchNoticeOk.config.peakNotice, false, 'peakNotice=false 生效')
 assert.equal(reloaded.config.peakStyle, 'compact', 'peakStyle 默认 compact')
 const patchStyleBad = applyConfigPatch(reloaded.config, { peakStyle: 'fancy' })
 assert.ok(patchStyleBad.errors.length > 0, 'peakStyle 非法值被拒')
-const patchStyleOk = applyConfigPatch(reloaded.config, { peakStyle: 'classic' })
-assert.equal(patchStyleOk.errors.length, 0, 'peakStyle=classic 合法')
-assert.equal(patchStyleOk.config.peakStyle, 'classic', 'peakStyle=classic 生效')
-console.log('[ok] peakStyle 样式配置校验通过')
+for (const style of ['classic', 'dynamic']) {
+  const patchStyleOk = applyConfigPatch(reloaded.config, { peakStyle: style })
+  assert.equal(patchStyleOk.errors.length, 0, 'peakStyle=' + style + ' 合法')
+  assert.equal(patchStyleOk.config.peakStyle, style, 'peakStyle=' + style + ' 生效')
+}
+// dynamic 样式的渲染在按需分块 lib/client.peak.js 里,主包只保留懒加载接线。
+const peakChunk = readFileSync(new URL('../lib/client.peak.js', import.meta.url), 'utf8')
+assert.ok(Buffer.byteLength(peakChunk, 'utf8') < 262144, 'lib/client.peak.js 同样受 256 KiB 单文件上限约束')
+// 刻度滑块是空心胶囊,描边取 brand-primary(亮色近黑 / 暗色近白),故不需要自行探测主题;
+// 轨道粗细对齐简洁样式(6px)。
+assert.match(peakChunk, /--cm-pkw-rim:var\(--dsw-alias-brand-primary\)/, '空心胶囊描边取主题反色变量')
+assert.match(peakChunk, /height:6px/, '动态样式轨道粗细对齐简洁样式')
+console.log('[ok] peakStyle 样式配置校验通过(compact / classic / dynamic)')
 // prices.models 使用替换语义,删除模型后不会被 mergeDeep 恢复。
 const priceDeletePatch = applyConfigPatch(reloaded.config, {
   prices: { ...reloaded.config.prices, models: { 'deepseek-v4-flash': reloaded.config.prices.models['deepseek-v4-flash'] } },

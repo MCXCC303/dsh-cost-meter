@@ -27,7 +27,7 @@ const state = { today: totals(1 / 7.2), month: totals(8 / 7.2), total: totals(9 
 let combinations = 0
 for (const sidebarSimple of [false, true]) for (const wide of [false, true]) for (const budget of [false, true])
 for (const hideTodayCost of [false, true]) for (const peakEnabled of [false, true]) for (const peakNotice of [false, true])
-for (const peakStyle of ['compact', 'classic']) for (const go of [false, true]) {
+for (const peakStyle of ['compact', 'classic', 'dynamic']) for (const go of [false, true]) {
   state.config = sanitizeConfig({ sidebarSimple, hideTodayCost, peakEnabled, peakNotice, peakStyle,
     balance: { display: 'sidebar', showProgressBar: true }, budget: { enabled: budget, amount: 10 }, goQuota: { enabled: go, display: 'sidebar' } })
   const tree = render(ui.SidebarFooter({ wide, useCost: pick => pick({ state }) }))
@@ -35,7 +35,15 @@ for (const peakStyle of ['compact', 'classic']) for (const go of [false, true]) 
   const strips = nodes(tree).filter(n => peakClasses.some(cls => hasClass(n, cls)))
   const expected = peakEnabled && peakNotice && (!wide || budget || !hideTodayCost) ? 1 : 0
   assert.equal(strips.length, expected, JSON.stringify({ sidebarSimple, wide, budget, hideTodayCost, peakEnabled, peakNotice, peakStyle, go }))
-  if (expected) assert.ok(hasClass(strips[0], wide ? peakStyle === 'classic' ? 'cm-peak-classic' : 'cm-peak-strip' : peakStyle === 'classic' ? 'cm-peak-rail-classic' : 'cm-peak-rail'))
+  // dynamic 样式的渲染在按需分块里:未注入加载器时退回简洁样式(本测试不注入),
+  // classic/compact 维持各自类名,避免懒加载接线把既有样式带偏。
+  if (expected) {
+    const shape = wide
+      ? peakStyle === 'classic' ? 'cm-peak-classic' : 'cm-peak-strip'
+      : peakStyle === 'classic' ? 'cm-peak-rail-classic' : 'cm-peak-rail'
+    assert.ok(hasClass(strips[0], shape), JSON.stringify({ peakStyle, wide, expected: shape }))
+    assert.ok(!hasClass(strips[0], 'cm-pkw'), '主包不内联动态样式的分段结构')
+  }
   const summaries = nodes(tree).filter(n => hasClass(n, 'cm-simple-summary'))
   assert.equal(summaries.length, sidebarSimple && wide && !hideTodayCost ? 1 : 0)
   if (sidebarSimple && wide && budget && !hideTodayCost) {
