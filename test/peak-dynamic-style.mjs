@@ -253,12 +253,10 @@ assert.throws(() => uiHost.el(Promise.resolve(), {}), /Element type is invalid/,
 const mainArtifact = await loadArtifact('client.js', { react: uiHost.React })
 const requested = []
 const platformAsync = mainArtifact.require.async
-// 平台契约:require.async 返回分块的导出对象(mod.mount / mod.Phase…);助手内部按
-// loadArtifact 的形态返回 { exports, require, registration },这里抹平成真实契约。
+// 平台契约:require.async 返回分块的导出对象(mod.mount / mod.Phase…);助手已按此契约返回。
 mainArtifact.require.async = async path => {
   requested.push(path)
-  const nested = await platformAsync(path)
-  return nested?.exports ?? nested
+  return platformAsync(path)
 }
 const totals = { cost: 1, apiCost: 1, calls: 1, input: 10, output: 2, cacheRead: 0, cacheWrite: 0 }
 const fakeState = {

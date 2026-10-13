@@ -318,9 +318,25 @@ jobs:
           export DSH_TEST_NODE_MODULES="$PWD/.tmp-install-host/node_modules"
           node test/verify.mjs
           node test/market-hot-install.mjs
-      # 产物漂移门禁(v1.6.8):lib/client.js 是提交进仓库的压缩产物,无 prepare/prepack
+      # 产物漂移门禁(v1.6.8):lib/ 下是提交进仓库的构建产物,无 prepare/prepack
       # 钩子,全靠手工构建后提交,此前实测已发生漂移。此处重新构建并比对,任何未提交
-      # 的产物差异都会让 CI 变红,杜绝把过期 bundle 发布出去。
-      - name: Check client bundle is in sync with src
+      # 的产物差异都会让 CI 变红,杜绝把过期产物发布出去。
+      #
+      # 重构后产物形态:宿主走 tsdown(Node ESM + .d.ts),浏览器走 esbuild 的
+      # 「启动包 + 按需分块」。校验覆盖全部 7 个 JS 产物;.d.ts / .js.map 同样
+      # 提交,一并比对,避免类型声明与 JS 产物不同步。
+      - name: Check build artifacts are in sync with src
         shell: bash
-        run: node scripts/build.mjs && git diff --exit-code lib/client.js lib/client.statistics.js lib/client.openrouter.js lib/client.peak.js
+        run: |
+          node scripts/build.mjs
+          git diff --exit-code \
+            lib/index.js lib/index.d.ts lib/index.js.map \
+            lib/typert.js lib/typert.d.ts lib/typert.js.map \
+            lib/client.js \
+            lib/client.peak.js lib/client.settings.js \
+            lib/client.statistics.js lib/client.openrouter.js
+
+      # 类型门禁:重构后 src/** 全为 TypeScript(strict),任何类型错误都必须让 CI 变红。
+      - name: Typecheck (tsc --noEmit)
+        shell: bash
+        run: npx tsc --noEmit --pretty false
