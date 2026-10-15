@@ -38,8 +38,9 @@ const rpc={getLocalState:async()=>({ok:true,value:state}),getState:async()=>({ok
 const ready=main.apply({remote:{$mount:async()=>()=>{}},get:n=>n==='remote.costMeter'?rpc:n==='slots'?slots:undefined,effect:fn=>fn(),on:()=>()=>{}});
 const props={sessionId:'synthetic',useCost:()=>({state:{config,budgetUsed:0}}),api:{loadStatistics:async()=>()=>React.createElement('p',null,'Synthetic details')}};
 const title=locale==='zh'?'这是一段需要保留可读性的会话标题':'A conversation title that must remain readable';
-ready.then(()=>{const SessionStatisticsButton=registrations.get('conversation.composer.dock:cost-meter-statistics')??registrations.get('conversation.session.header.actions:cost-meter-statistics');const CornerChips=registrations.get('conversation.composer.dock:cost-meter-corner');
-createRoot(document.getElementById('root')).render(React.createElement(React.Fragment,null,
+// 角标注册发生在首次快照到位后的 sync(与线上一致):等两条注册都出现再渲染。
+const waitFor=key=>new Promise((resolve,reject)=>{const started=Date.now();const tick=()=>registrations.has(key)?resolve(registrations.get(key)):(Date.now()-started>5000?reject(new Error('timeout waiting for '+key)):setTimeout(tick,20));tick()});
+Promise.all([waitFor('conversation.composer.dock:cost-meter-statistics'),waitFor('conversation.composer.dock:cost-meter-corner')]).then(([SessionStatisticsButton,CornerChips])=>{createRoot(document.getElementById('root')).render(React.createElement(React.Fragment,null,
   React.createElement('header',null,React.createElement('span',{className:'title'},title),React.createElement('button',null,'PTC'),React.createElement(SessionStatisticsButton,{...props,entryPosition:'header'})),
   React.createElement('main',null,'Synthetic conversation'),
   React.createElement('footer',null,React.createElement('div',{'data-slot':'conversation.composer.dock'},
@@ -47,7 +48,7 @@ createRoot(document.getElementById('root')).render(React.createElement(React.Fra
       React.createElement('span',{className:'native-pill'},locale==='zh'?'◷ 2 轮 26 步 · 273 tok/s':'◷ 2 turns 26 steps · 273 tok/s'),
       React.createElement('span',{className:'native-pill'},locale==='zh'?'▤ 1.4M tok · 缓存命中 98%':'▤ 1.4M tok · cache hit 98%')),
     React.createElement(SessionStatisticsButton,{...props,entryPosition:'dock'}),
-    React.createElement(CornerChips,props)),React.createElement('span',{className:'context-meter'},'◌ 8%'))))});`
+    React.createElement(CornerChips,props)),React.createElement('span',{className:'context-meter'},'◌ 8%'))))}).catch(error=>{const pre=document.createElement('pre');pre.id='boot-error';pre.textContent='BOOT FAIL '+(error&&error.message||error);document.body.appendChild(pre)});`
 const localReact = (() => { try { createRequire(join(root, 'package.json')).resolve('react'); return true } catch (error) { return false } })()
 const hostModules = positional[0] ?? process.env.DSH_TEST_NODE_MODULES
 if (!localReact && !hostModules) throw new Error('react 不可解析:请在仓库根安装依赖,或用 [node_modules 目录] / DSH_TEST_NODE_MODULES 指定')

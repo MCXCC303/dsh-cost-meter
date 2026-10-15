@@ -36,7 +36,7 @@ export const STAT_DIALOG_CLASS = 'cm-stat-dialog'
  * 函数组件节点,重面板 arrive 之后才替换;若改成"等分块到了才渲染节点",
  * 打开弹窗的瞬间内容区是空的。
  */
-function StatisticsBody(props: any) {
+export function StatisticsBody(props: any) {
   const load = props.load ?? props.api.loadStatistics
   const [Page, setPage] = useState(() => loadedPages.get(load) ?? null) as [any, (value: any) => void]
   const [error, setError] = useState('') as [string, (value: string) => void]

@@ -9,6 +9,7 @@ import React from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 
 import { makeT, resolveLocale, USAGE_POSITION_SWITCHABLE } from './t.js'
+import { loadedPages, warmPage, StatisticsBody as BillingStatistics } from './ui-statistics-entry.js'
 import { numInput, prettyProviderKey, modelStatsRows } from './ui-shared.js'
 
 // React 钩子/工厂:与旧片段同形,便于逐行对照。
@@ -49,20 +50,10 @@ export function Card(props) {
     el('p', { className: 'cm-card-sub' }, props.sub))
 }
 
-export const loadedPages = new WeakMap()
-export const warmPage = (load, props) => load?.().then(page => { loadedPages.set(load, page); return page.prefetch?.(props) }).catch(() => {})
-export function BillingStatistics(props) {
-  const load = props.load ?? props.api.loadStatistics
-  const [Page, setPage] = useState(() => loadedPages.get(load) ?? null), [error, setError] = useState(''), [retry, setRetry] = useState(0)
-  useEffect(() => {
-    let active = true
-    setError('')
-    load().then(page => { loadedPages.set(load, page); if (active) setPage(() => page) }, e => { if (active) setError(String(e.message ?? e)) })
-    return () => { active = false }
-  }, [props.api, props.load, retry])
-  if (Page) return el(Page, { ...props, formatMoneyUsd, formatTokens, resolveLocale })
-  return el('div', { className: error ? '' : 'cm-loading', role: error ? 'alert' : 'status', 'aria-label': resolveLocale(props.state?.config) === 'en' ? 'Loading' : '正在读取' }, error || el(Fragment, null, el('i'), el('i'), el('i')), error ? el('button', { className: 'cm-btn', onClick: () => setRetry(n => n + 1) }, '↻') : null)
-}
+// 懒加载助手与统计弹窗壳统一住在 ui-statistics-entry.ts(启动包侧),
+// 这里转出以保持既有调用点不变;settings 分块会把它内联一份,
+// 跨入口共享缓存需要显式全局,当前仅影响预取命中率、不影响正确性。
+export { loadedPages, warmPage, StatisticsBody as BillingStatistics } from './ui-statistics-entry.js'
 
 /**
  * 费用明细弹窗的定位与尺寸。
