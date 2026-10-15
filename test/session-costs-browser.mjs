@@ -6,6 +6,7 @@ import { createServer } from 'node:http'
 import { resolve, join } from 'node:path'
 import { build } from 'esbuild'
 import { javascriptLiteral as literal } from '../scripts/javascript-literal.mjs'
+import { sanitizeConfig } from '../lib/store.js'
 
 const modules = resolve(process.env.DSH_TEST_UI_MODULES ?? process.env.DSH_TEST_NODE_MODULES ?? '.tmp-pr240-host/node_modules')
 const req = createRequire(join(modules, '__session_costs.cjs'))
@@ -14,14 +15,25 @@ const { chromium } = browserReq('playwright-core')
 const executablePath = process.env.CM_TEST_BROWSER ?? ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', '/usr/bin/google-chrome', '/usr/bin/chromium'].find(existsSync)
 assert.ok(executablePath, 'a local Chromium browser is required')
 const output = resolve('.tmp-session-costs-review'); mkdirSync(output, { recursive: true })
-const client = readdirSync('src/client').filter(name => name.endsWith('.js')).sort().map(name => readFileSync('src/client/' + name, 'utf8')).join('')
-  .replace('exports.apply = apply', 'exports.preview = { SessionStatisticsButton }; exports.apply = apply')
+// 客户端实现来自构建产物(旧 src/client/*.js 片段已删):启动包模块体注入样式表,
+// 并由 apply(ctx) 走真实注册路径取回「费用明细」入口按钮;重面板仍来自 client.statistics.js。
+const clientArtifact = readFileSync('lib/client.js', 'utf8')
+const bootConfig = sanitizeConfig({ locale: 'zh' })
 const source = `
 import React from ${literal(req.resolve('react'))};
+import * as ReactDOM from ${literal(req.resolve('react-dom'))};
 import {createRoot} from ${literal(req.resolve('react-dom/client'))};
 const h=React.createElement;
-window.__ModuleLoader__={load:mod=>window.mainUI=mod.factory(name=>name==='react'?React:{Tooltip:({children})=>children})};
-${client}
+const seeds=id=>id==='react'?React:id==='react-dom'?ReactDOM:id==='@deepseek-ai/dsh-client-ui-primitives'?{Tooltip:({children})=>children}:(()=>{throw new Error('missing seed '+id)})();
+let mainFactory;window.__ModuleLoader__={load:mod=>mainFactory=mod.factory};
+new Function(${literal(clientArtifact)})();
+const main=mainFactory(seeds);
+window.__registrations=new Map();
+const slots={inject:(_,cb)=>{cb()},register:(o,c)=>{window.__registrations.set(o.name+':'+o.id,c);return()=>{}},entries:()=>[]};
+const bootState={config:${literal(bootConfig)},today:{cost:0},month:{cost:0},total:{cost:0},history:[],balance:{status:'off'},goQuota:{status:'off'},codingPlans:{},gatewayQuotas:{sources:[]}};
+const rpc={getLocalState:async()=>({ok:true,value:bootState}),getState:async()=>({ok:true,value:bootState})};
+main.apply({remote:{$mount:async()=>()=>{}},get:n=>n==='remote.costMeter'?rpc:n==='slots'?slots:undefined,effect:fn=>fn(),on:()=>()=>{}});
+window.__main=main;
 window.__ModuleLoader__={load:mod=>window.statsUI=mod.factory(()=>React)};
 ${readFileSync('lib/client.statistics.js', 'utf8')}
 const UI=window.statsUI, count={input:1176,cacheRead:117600,cacheWrite:0,output:5894,reasoning:0,calls:7,cost:.027104,apiCost:.027104};
@@ -46,8 +58,11 @@ const StatisticsPage=props=>h(UI.SessionStatistics,{...props,contextIntegration:
 StatisticsPage.prefetch=props=>UI.prefetchStatistics(api,props);
 api.loadStatistics=async()=>StatisticsPage;
 const root=createRoot(document.getElementById('root'));
-window.renderSession=(id='current')=>root.render(h(window.mainUI.preview.SessionStatisticsButton,{sessionId:id,useCost:()=>({state}),api,entryPosition:'dock'}));
-window.renderSession();window.fixtureReady=true;
+let SessionStatisticsButton=null;
+window.renderSession=(id='current')=>root.render(h(SessionStatisticsButton,{sessionId:id,useCost:()=>({state}),api,entryPosition:'dock'}));
+// 入口按钮在首次快照到位后的 sync 里注册(与线上一致):等它出现再首渲染。
+const waitForEntry=()=>new Promise((resolve,reject)=>{const started=Date.now();const tick=()=>{const component=window.__registrations.get('conversation.composer.dock:cost-meter-statistics');if(component)return resolve(component);if(Date.now()-started>5000)return reject(new Error('timeout waiting for dialog entry registration'));setTimeout(tick,20)};tick()});
+waitForEntry().then(component=>{SessionStatisticsButton=component;window.renderSession();window.fixtureReady=true});
 `
 const compiled = await build({ stdin: { contents: source, resolveDir: process.cwd(), loader: 'js' }, bundle: true, write: false, format: 'iife', platform: 'browser' })
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>

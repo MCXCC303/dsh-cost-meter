@@ -62,7 +62,8 @@ const overview = `<!doctype html><meta charset="utf-8"><title>Cost entry layout 
 ${widths.flatMap(width => ['zh','en'].map(locale => `<section>${width}px · ${locale}<br><iframe title="${width}-${locale}" width="${width}" src="/case?locale=${locale}"></iframe></section>`)).join('')}
 <script>
 document.getElementById('run').onclick=async()=>{let checks=0;const check=(ok,msg)=>{checks++;if(!ok)throw Error(msg)};
-try{for(const frame of document.querySelectorAll('iframe')){const doc=frame.contentDocument,win=frame.contentWindow,header=doc.querySelector('.cm-stat-header'),dock=doc.querySelector('.cm-stat-dock'),title=doc.querySelector('.title');
+const waitFor=(fn,timeout=8000)=>{const deadline=Date.now()+timeout;return new Promise((res,rej)=>{const tick=()=>{let v=false;try{v=fn()}catch(e){}if(v)return res();if(Date.now()>deadline)return rej(Error('timeout waiting for iframe content'));setTimeout(tick,50)};tick()})};
+try{const frames=[...document.querySelectorAll('iframe')];await Promise.all(frames.map(f=>waitFor(()=>f.contentDocument?.querySelector?.('.cm-stat-entry'))));for(const frame of frames){const doc=frame.contentDocument,win=frame.contentWindow,header=doc.querySelector('.cm-stat-header'),dock=doc.querySelector('.cm-stat-dock'),title=doc.querySelector('.title');
 check(!!header&&!!dock,frame.title+' both configured entries mounted');
 check(dock.getBoundingClientRect().height<=24,frame.title+' compact typography');
 check(doc.documentElement.scrollWidth<=win.innerWidth,frame.title+' no horizontal page overflow');

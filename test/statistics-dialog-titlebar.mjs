@@ -18,12 +18,14 @@
 //   A. Windows 桌面版:弹窗与 40px 标题栏零重叠,且窄窗口不横向溢出;
 //   B. 桌面版全屏:--dsh-frame-chrome-top 归 0,弹窗回到普通 16px 边距(不留空隙);
 //   C. 纯 Web(无标记、变量缺失):回退 0px,行为与修复前一致。
-import { readFileSync, readdirSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import { build } from 'esbuild'
+import { sanitizeConfig } from '../lib/store.js'
 
 process.on('exit', () => { try { cleanupBrowser() } catch (error) { /* 退出路径上的清理失败无需上报 */ } })
 
@@ -32,9 +34,15 @@ const args = process.argv.slice(2)
 const positional = args.filter(arg => !arg.startsWith('--'))
 const explicitBrowser = (args.find(arg => arg.startsWith('--browser=')) ?? '').slice('--browser='.length)
 const waitForBrowser = args.includes('--wait')
+// react/react-dom 优先用仓库本地 node_modules(devDeps 已装);位置参数 / DSH_TEST_NODE_MODULES
+// 仍可作为兜底(与 statistics-layout.mjs 同约定)。
 const hostDir = positional[0] ?? process.env.DSH_TEST_NODE_MODULES ?? ''
-if (!hostDir) throw new Error('Pass the node_modules directory containing react and react-dom (argv or DSH_TEST_NODE_MODULES)')
-const nodeModules = resolve(hostDir)
+const nodeModules = hostDir ? resolve(hostDir) : ''
+if (!nodeModules) {
+  try { createRequire(join(root, 'package.json')).resolve('react') } catch (error) {
+    throw new Error('react 不可解析:请在仓库根安装依赖,或用 [node_modules 目录] / DSH_TEST_NODE_MODULES 指定')
+  }
+}
 
 // ── 无头浏览器:让本回归在 CI 里可判定 ──────────────────────────────────────
 // 只驱动一个已经存在的浏览器(不装 Playwright/Puppeteer):GitHub runner 与常见桌面
@@ -85,15 +93,22 @@ function launchBrowser(url) {
   browserProcess.on('exit', code => { if (!reported) console.log('browser exited before reporting (code ' + code + ')') })
 }
 
-// 拼接顺序片段(与 scripts/build.mjs 同口径),额外暴露内部组件供测量页渲染真实弹窗。
-const source = readdirSync(resolve(root, 'src/client')).filter(n => n.endsWith('.js')).sort()
-  .map(n => readFileSync(resolve(root, 'src/client', n), 'utf8')).join('')
-  .replace('exports.apply = apply', 'exports.preview = { SessionStatisticsButton }; exports.apply = apply')
+// 客户端实现来自构建产物(旧 src/client/*.js 片段已删):启动包模块体负责样式注入,
+// 再走真实激活路径(apply(ctx) → slots 注册)取回「费用明细」入口按钮 —— 与线上同源。
+const clientArtifact = readFileSync(resolve(root, 'lib/client.js'), 'utf8')
+const bootConfig = sanitizeConfig({ locale: 'zh' })
 
-const entry = `import React from 'react'; import {createRoot} from 'react-dom/client';
-let factory; window.__ModuleLoader__={load:m=>factory=m.factory};
-${source}
-const ui=factory(n=>n==='react'?React:{Tooltip:({children})=>children}).preview;
+const entry = `import React from 'react'; import * as ReactDOM from 'react-dom'; import {createRoot} from 'react-dom/client';
+const seeds=id=>id==='react'?React:id==='react-dom'?ReactDOM:id==='@deepseek-ai/dsh-client-ui-primitives'?{Tooltip:({children})=>children}:(()=>{throw new Error('missing seed '+id)})();
+let mainFactory; window.__ModuleLoader__={load:m=>mainFactory=m.factory};
+new Function(${JSON.stringify(clientArtifact)})();
+const main=mainFactory(seeds);
+const registrations=new Map();
+const slots={inject:(_,cb)=>{cb()},register:(o,c)=>{registrations.set(o.name+':'+o.id,c);return()=>{}},entries:()=>[]};
+const bootState={config:${JSON.stringify(bootConfig)},today:{cost:0},month:{cost:0},total:{cost:0},history:[],balance:{status:'off'},goQuota:{status:'off'},codingPlans:{},gatewayQuotas:{sources:[]}};
+const rpc={getLocalState:async()=>({ok:true,value:bootState}),getState:async()=>({ok:true,value:bootState})};
+main.apply({remote:{$mount:async()=>()=>{}},get:n=>n==='remote.costMeter'?rpc:n==='slots'?slots:undefined,effect:fn=>fn(),on:()=>()=>{}});
+let SessionStatisticsButton=null;
 const config={locale:'zh',decimals:2,showTotalWithPlan:false};
 // [关键] 明细内容必须足够高,弹窗才会被 max-height 顶到可用区上沿。
 // 若这里只给一句短占位,弹窗只有 ~96px、垂直居中后根本够不到标题栏,
@@ -106,13 +121,15 @@ const props={sessionId:'synthetic',useCost:()=>({state:{config}}),api:{loadStati
 // session-reset effect runs. Clicking at that point can have its open state reset.
 function App(){
   React.useEffect(()=>{window.fixtureReady=true},[]);
-  return React.createElement(ui.SessionStatisticsButton,{...props,entryPosition:'dock'});
+  return React.createElement(SessionStatisticsButton,{...props,entryPosition:'dock'});
 }
-createRoot(document.getElementById('root')).render(React.createElement(App));`
+// 入口按钮在首次快照到位后的 sync 里注册(与线上一致):等它出现再首渲染。
+const waitForEntry=()=>new Promise((resolve,reject)=>{const started=Date.now();const tick=()=>{const component=registrations.get('conversation.composer.dock:cost-meter-statistics');if(component)return resolve(component);if(Date.now()-started>5000)return reject(new Error('timeout waiting for dialog entry registration'));setTimeout(tick,20)};tick()});
+waitForEntry().then(component=>{SessionStatisticsButton=component;createRoot(document.getElementById('root')).render(React.createElement(App))});`
 
 const bundle = await build({
   stdin: { contents: entry, loader: 'js', resolveDir: root }, bundle: true, write: false,
-  nodePaths: [nodeModules], format: 'iife', define: { 'process.env.NODE_ENV': '"production"' },
+  ...(nodeModules ? { nodePaths: [nodeModules] } : {}), format: 'iife', define: { 'process.env.NODE_ENV': '"production"' },
 })
 
 // 每个用例:同一弹窗在三种宿主环境 + 多种视口下的几何断言。

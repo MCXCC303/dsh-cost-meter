@@ -19,12 +19,18 @@ const executablePath = process.env.CM_TEST_BROWSER ?? [
 ].find(existsSync)
 assert.ok(executablePath, 'a local Chromium browser is required')
 const baseline = process.argv.includes('--baseline') ? process.argv[process.argv.indexOf('--baseline') + 1] : null
-const readSource = file => baseline
+// 客户端实现来自构建产物(旧 src/client/*.js 片段已删):设置面板在按需分块
+// lib/client.settings.js 里,按平台 classic-script 语义执行它并取回 CostSection;
+// parseConfig 未从任何产物导出,故由打包器直接取 src/client/logic.ts 的同一实现
+// (onLoad 追加一条等价 export,实现零改动)。
+const readArtifact = file => baseline
   ? execFileSync('git', ['show', `${baseline}:${file}`], { encoding: 'utf8' })
   : readFileSync(file, 'utf8')
-const client = readdirSync('src/client').filter(name => name.endsWith('.js')).sort()
-  .map(name => readSource('src/client/' + name)).join('')
-  .replace('exports.apply = apply', 'exports.preview = { CostSection, parseConfig }; exports.apply = apply')
+// 样式表(.cm-input option 主题色)由启动包模块体注入,故两个产物都要执行:
+// client.js 负责 createStyleTag(与线上同源),client.settings.js 提供 CostSection。
+const startupArtifact = readArtifact('lib/client.js')
+const settingsArtifact = readArtifact('lib/client.settings.js')
+const logicPath = resolve('src/client/logic.ts')
 const day = { ...zeroDay('2026-10-12'), byProviderModel: {
   'fixture:unknown': { input: 1, output: 1, calls: 1, cost: 0 },
   'deepseek:deepseek-v4-flash': { input: 1, output: 1, calls: 1, cost: .001 },
@@ -32,17 +38,35 @@ const day = { ...zeroDay('2026-10-12'), byProviderModel: {
 const initialState = { config: sanitizeConfig({ locale: 'zh' }), today: day, month: day, total: day, history: [], balance: {} }
 const code = `
 import React from ${literal(req.resolve('react'))};
+import * as ReactDOM from ${literal(req.resolve('react-dom'))};
 import {createRoot} from ${literal(req.resolve('react-dom/client'))};
-window.__ModuleLoader__={load:mod=>window.costUI=mod.factory(name=>name==='react'?React:{Tooltip:({children})=>children})};
-${client}
-const {CostSection,parseConfig}=window.costUI.preview;
+import { parseConfig } from ${literal(logicPath)};
+const seeds=id=>id==='react'?React:id==='react-dom'?ReactDOM:id==='@deepseek-ai/dsh-client-ui-primitives'?{Tooltip:({children})=>children}:(()=>{throw new Error('missing seed '+id)})();
+let startupFactory;window.__ModuleLoader__={load:mod=>startupFactory=mod.factory};
+new Function(${literal(startupArtifact)})();
+startupFactory(seeds);
+let factory;window.__ModuleLoader__={load:mod=>factory=mod.factory};
+new Function(${literal(settingsArtifact)})();
+const {CostSection}=factory(seeds);
 const state=${literal(initialState)};state.config=parseConfig(state.config,'config');
 window.patches=[];
 const api={loadOpenRouter:async()=>()=>null,updateConfig:async patch=>{window.patches.push(patch)}};
 createRoot(document.getElementById('root')).render(React.createElement(CostSection,{useCost:()=>({state,status:'ready'}),api}));
 window.fixtureReady=true;
 `
-const compiled = await build({ stdin: { contents: code, resolveDir: process.cwd(), loader: 'js' }, bundle: true, write: false, format: 'iife', platform: 'browser' })
+const compiled = await build({
+  stdin: { contents: code, resolveDir: process.cwd(), loader: 'js' },
+  bundle: true, write: false, format: 'iife', platform: 'browser',
+  plugins: [{
+    name: 'expose-parse-config',
+    setup(build_) {
+      build_.onLoad({ filter: /logic\.ts$/ }, args => ({
+        contents: readFileSync(args.path, 'utf8') + '\nexport { parseConfig }\n',
+        loader: 'ts',
+      }))
+    },
+  }],
+})
 // Token values copied from the published skin source, with provenance pinned.
 // https://github.com/RevolutionLA/dsh-dream-skin/blob/86761e4106874f3c0646c74f95a1a2d252c4b9ce/lib/client.js
 const light = { '--dsw-alias-label-primary': '#25262b', '--dsw-alias-label-secondary': '#737780', '--dsw-alias-label-tertiary': '#858a94', '--dsw-alias-bg-base': '#fff', '--dsw-alias-bg-layer-1': '#f7f8fa', '--dsw-alias-border-l1': '#e5e7eb', '--dsw-alias-button-elevated-fill': '#fff', '--dsw-alias-state-business-primary': '#4d6bfe' }
