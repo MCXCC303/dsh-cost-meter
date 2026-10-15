@@ -38,6 +38,12 @@ const css = [
   // 轨道高度对齐「简洁」样式(6px),只用一层 --cm-pkw-* 变量承载明暗两套取值。
   '.cm-pkw-track{--cm-pkw-rim:var(--dsw-alias-brand-primary);position:relative;display:flex;flex:1;height:6px;min-width:0;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-3);box-sizing:border-box}',
   '.cm-pkw-seg{flex:none;overflow:hidden}',
+  // 两端圆角:轨道本身是胶囊,但色块是直角矩形,且轨道不能 overflow:hidden
+  // (刻度滑块要竖向溢出轨道),故由首/末色块各自补上外侧圆角。
+  '.cm-pkw-edge-start{border-top-left-radius:999px;border-bottom-left-radius:999px}',
+  '.cm-pkw-edge-end{border-top-right-radius:999px;border-bottom-right-radius:999px}',
+  '.cm-peak-rail-track .cm-pkw-edge-start{border-top-left-radius:0;border-bottom-left-radius:0;border-top-right-radius:999px;border-bottom-right-radius:999px}',
+  '.cm-peak-rail-track .cm-pkw-edge-end{border-top-left-radius:0;border-bottom-left-radius:0;border-top-right-radius:0;border-bottom-right-radius:0;border-bottom-left-radius:999px;border-bottom-right-radius:999px}',
   '.cm-pkw-seg.peak{background:#ff9800}',
   '.cm-pkw-seg.off{background:var(--dsw-alias-state-business-primary)}',
   // 刻度滑块:空心胶囊——不填充,只留醒目描边(亮色主题近黑、暗色主题近白),
@@ -48,6 +54,8 @@ const css = [
   // 窄栏(rail)态:沿用主包 .cm-peak-rail 的外框,只补竖排分段与滑块(比例同宽栏)。
   '.cm-peak-rail.wiper .cm-peak-rail-track{--cm-pkw-rim:var(--dsw-alias-brand-primary);position:relative;display:flex;flex-direction:column;flex:none;width:6px;height:56px;border-radius:999px;overflow:visible;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-3);box-sizing:border-box}',
   '.cm-peak-rail.wiper .cm-pkw-rail-seg{flex:none;width:100%;min-height:0}',
+  // 竖向 rail 同理:上下两端补圆角,让色块贴合胶囊轨道的端头。
+
   '.cm-peak-rail.wiper .cm-pkw-rail-seg.peak{background:#ff9800}',
   '.cm-peak-rail.wiper .cm-pkw-rail-seg.off{background:var(--dsw-alias-state-business-primary)}',
   '.cm-peak-rail.wiper .cm-pkw-rail-cap{position:absolute;left:50%;height:4px;width:calc(100% + 8px);min-width:13px;border-radius:999px;border:1.5px solid var(--cm-pkw-rim);box-sizing:border-box;transform:translate(-50%,-50%);transition:top .4s ease;z-index:2;pointer-events:none}',
@@ -176,7 +184,12 @@ function Track(props: any) {
   return el('div', { className: rail ? 'cm-peak-rail-track' : 'cm-pkw-track' },
     axis.bands.map((band: any, i: number) => el('div', {
       key: 'band' + i,
-      className: prefix + '-seg ' + (band.peak ? 'peak' : 'off'),
+      // 端头标记:轨道是胶囊,但色块是直角矩形;轨道不能 overflow:hidden(刻度滑块
+      // 要竖向溢出),故由首/末段自带圆角。不能用 CSS 兄弟选择器取末段 ——
+      // 滑块同为 div,:last-of-type 会选中滑块。
+      className: prefix + '-seg ' + (band.peak ? 'peak' : 'off')
+        + (i === 0 ? ' cm-pkw-edge-start' : '')
+        + (i === axis.bands.length - 1 ? ' cm-pkw-edge-end' : ''),
       style: rail ? { height: (band.end - band.start) / 24 * 100 + '%' } : { width: (band.end - band.start) / 24 * 100 + '%' },
     })),
     el('div', { className: prefix + '-cap', style: rail ? { top: axis.br + '%' } : { left: axis.br + '%' } }))
