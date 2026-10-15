@@ -1,0 +1,230 @@
+import { statSync } from 'node:fs'
+import { join } from 'node:path'
+import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { listSessionLogs, iterateSessionRecords, replaySessionRecords } from './backfill.js'
+import { nativeSearchRecordsFor } from './native-search-history.js'
+import { tierFor, usdFromCost } from './pricing.js'
+import { isNativeSearchUsageEvent } from './native-search-events.js'
+import { ledgerStatisticsQuery, matchesStats, selectedStats, emptyStats, STAT_FIELDS } from './billing-statistics.js'
+import { localDayKey } from './store.js'
+import { sessionCostIds } from './session-tree.js'
+import type { DayRecord } from './types.js'
+
+/** 一条按 provider×model×bucket 拆分的计费行(供明细展示)。 */
+export interface CostRow {
+  provider?: string
+  model?: string
+  bucket: string
+  tokens: number
+  rate: number
+  cost: number
+  priced?: boolean
+  plan?: boolean
+}
+
+/** 一次采样的展开结果(轮次 / session 明细里的一次调用)。 */
+export interface CostCall {
+  sessionId: string
+  kind?: string
+  turn?: number | null
+  step?: number | null
+  provider?: string
+  model?: string
+  atMs: number
+  cost: number
+  apiCost: number
+  plan: boolean
+  priced?: boolean
+  longContext: boolean
+  rows: CostRow[]
+  logSeq?: number | null
+}
+
+/** turnCostFromRecords / costFromSamples 的返回形状。 */
+export interface TurnCostDetail {
+  found: boolean
+  cost: number
+  apiCost: number
+  rows: CostRow[]
+  calls: CostCall[]
+}
+
+/** backfill.replaySessionRecords 产出的计费样本(直接复用其返回类型,避免重复建模)。 */
+type ReplaySample = NonNullable<ReturnType<typeof replaySessionRecords>['samples']>[number]
+
+/** 原生搜索历史记录(此处只用其 startedAtMs 归属时刻)。 */
+interface NativeSearchRecord {
+  data: { startedAtMs: number }
+}
+
+/** 会话用量日志行(只保留计费所需字段的投影)。 */
+interface UsageRecordRow {
+  type?: string
+  id?: string
+  seq?: number
+  time?: number
+  createdAt?: number
+  data?: any
+  // TODO(types): data 为宿主会话日志的任意 JSON payload,待 backfill 侧给出事件类型后收敛。
+}
+
+/** 本会话出现过、但没有计费调用的轮次。 */
+interface EmptyTurn {
+  sessionId: string
+  turn: number
+}
+
+const cache = new Map()
+const fields = { input: 'cacheMiss', output: 'output', cacheRead: 'cacheHit', cacheWrite: 'cacheWrite', reasoning: 'reasoning' }
+const emptyTurn = (): TurnCostDetail => ({ found: false, cost: 0, apiCost: 0, rows: [], calls: [] })
+export function turnCostFromRecords(records, config, startSeq, endSeq, native: NativeSearchRecord[] = []): TurnCostDetail {
+  const start = records.find(row => row.seq === startSeq && row.type === 'turn/start')
+  const end = records.find(row => row.seq === endSeq && row.type === 'turn/end')
+  if (!start || !end || endSeq < startSeq || start.data?.turn !== end.data?.turn) return emptyTurn()
+  const headers = records.filter(row => row.type === 'request/header' && row.seq < startSeq).slice(-1)
+  const selected = [...headers, ...records.filter(row => row.seq >= startSeq && row.seq <= endSeq),
+    ...native.filter(row => row.data.startedAtMs >= start.time && row.data.startedAtMs <= end.time)]
+  const { samples } = replaySessionRecords(selected, config, null, true)
+  return costFromSamples(samples, config)
+}
+
+export function costFromSamples(samples, config): TurnCostDetail {
+  const parts = new Map<string, CostRow>()
+  const calls: CostCall[] = []
+  for (const sample of samples) {
+    let tier = tierFor(sample.resolved.entry, sample.atMs, sample.peak)
+    const longContext = !!tier.longContext && sample.buckets.input + sample.buckets.cacheRead + sample.buckets.cacheWrite > tier.longContext.aboveInputTokens
+    if (longContext) tier = tier.longContext
+    const call: CostCall = { sessionId: sample.sessionId ?? '', kind: sample.kind, turn: sample.turn ?? null, step: sample.step ?? null, provider: sample.provider, model: sample.model, atMs: sample.atMs, cost: sample.cost, apiCost: sample.apiCost, plan: sample.plan, priced: sample.resolved.priced, longContext, rows: [] }
+    for (const [bucket, priceKey] of Object.entries(fields)) {
+      const tokens = sample.buckets[bucket]
+      if (!tokens) continue
+      const rate = sample.resolved.priced ? usdFromCost(tier[priceKey] ?? (bucket === 'cacheWrite' ? tier.cacheHit : 0), sample.resolved.currency, config.exchangeRate) : 0
+      const plan = sample.plan
+      call.rows.push({ provider: sample.provider, model: sample.model, bucket, tokens, rate, cost: tokens * rate / 1e6, priced: sample.resolved.priced, plan })
+      const key = JSON.stringify([sample.provider, sample.model, bucket, rate, plan, sample.resolved.priced])
+      const row = parts.get(key) ?? { provider: sample.provider, model: sample.model, bucket, tokens: 0, rate, cost: 0, priced: sample.resolved.priced, plan }
+      row.tokens += tokens; row.cost += tokens * rate / 1e6
+      parts.set(key, row)
+    }
+    call.logSeq = sample.logSeq ?? null
+    calls.push(call)
+  }
+  calls.sort((a, b) => a.atMs - b.atMs)
+  return { found: samples.length > 0, cost: samples.reduce((n, row) => n + row.cost, 0), apiCost: samples.reduce((n, row) => n + row.apiCost, 0), rows: [...parts.values()], calls }
+}
+
+export async function getTurnCost(ledger, ctx, sessionId, startSeq, endSeq) {
+  if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 512 || ![startSeq, endSeq].every(n => Number.isSafeInteger(n) && n >= 0) || endSeq < startSeq) throw new Error('invalid turn identity')
+  const records = await sessionUsageRecords(ctx, sessionId)
+  return turnCostFromRecords(records, ledger.config, startSeq, endSeq, await nativeSearchRecordsFor(ledger.path, sessionId))
+}
+
+export async function sessionUsageRecords(ctx, sessionId) {
+  const session = ctx?.get?.('sessions')?.get?.(sessionId)
+  const live = session?.snapshotEvents?.()
+  if (Array.isArray(live)) return [{ type: 'session', id: sessionId, createdAt: session.header?.createdAt ?? 0 }, ...live]
+  const paths = listSessionLogs(join(resolveDshHome(), 'sessions'), new Set([sessionId]))
+  if (!paths.length) return []
+  const path = paths[0], info = statSync(path)
+  const key = `${path}:${info.size}:${info.mtimeMs}`
+  let pending = cache.get(key)
+  if (!pending) {
+    pending = (async () => {
+      const rows: UsageRecordRow[] = []
+      for await (const row of iterateSessionRecords(path)) {
+        if (row.type === 'session') rows.push({ type: 'session', id: row.id, createdAt: row.createdAt })
+        else if (isNativeSearchUsageEvent(row)) rows.push(row)
+        else if (row.type === 'request/header') rows.push({ type: row.type, seq: row.seq, time: row.time, data: { header: { config: { model: row.data?.header?.config?.model, provider: row.data?.header?.config?.provider } } } })
+        else if (['turn/start', 'turn/end', 'compaction/summary', 'assistant/message'].includes(row.type) || row.type === 'assistant/chunk' && row.data?.chunk?.type === 'usage') {
+          rows.push({ type: row.type, seq: row.seq, time: row.time, data: { turn: row.data?.turn, step: row.data?.step, provider: row.data?.provider, model: row.data?.model,
+            usage: row.data?.usage, message: { source: row.data?.message?.source }, chunk: row.data?.chunk?.type === 'usage' ? row.data.chunk : undefined } })
+        }
+        if (rows.length > 200_000) throw new Error('Session usage history exceeds the turn detail limit')
+      }
+      return rows
+    })()
+    cache.set(key, pending)
+    if (cache.size > 16) cache.delete(cache.keys().next().value)
+    pending.catch(() => cache.delete(key))
+  }
+  return pending
+}
+
+/** Detail is reconstructed only for the selected session; the stored ledger remains authoritative. */
+export async function getSessionBilling(ledger, ctx, raw) {
+  const query = ledgerStatisticsQuery(ledger, raw)
+  if (!query.sessionId) throw new Error('sessionId is required for billing detail')
+  const ids = await sessionCostIds(ledger, ctx, query.sessionId)
+  const selected: ReplaySample[] = [], emptyTurns: EmptyTurn[] = []
+  // Read one log at a time. Retain billing fields only, not descendant conversations.
+  for (const sessionId of ids) {
+    const records = await sessionUsageRecords(ctx, sessionId)
+    const native = await nativeSearchRecordsFor(ledger.path, sessionId)
+    const { samples } = replaySessionRecords([...records, ...native], ledger.config, null, true)
+    for (const sample of samples!) if (!sample.seed && sample.date >= query.from && sample.date <= query.to && matchesStats(sample.providerKey, query)) selected.push({ ...sample, sessionId })
+    if (!query.provider && !query.model) for (const row of records) {
+      if (row.type !== 'turn/start' || !Number.isSafeInteger(row.data?.turn) || row.data.turn < 0 || !Number.isFinite(row.time)) continue
+      const date = localDayKey(row.time)
+      if (date >= query.from && date <= query.to) emptyTurns.push({ sessionId, turn: row.data.turn })
+    }
+  }
+  const detail = costFromSamples(selected, ledger.config)
+  // Rank against the full filtered history, before transporting a call page.
+  // Seven individual calls plus one remainder keep the chart and payload bounded.
+  const callShares = detail.calls.map((call, index) => ({ index, cost: call.cost, apiCost: call.apiCost,
+    tokens: call.rows.reduce((sum, row) => sum + (row.bucket === 'reasoning' ? 0 : row.tokens), 0), calls: 1, other: false,
+    unpriced: !call.priced && (query.basis === 'total' || (query.basis === 'plan' ? call.plan : !call.plan)) }))
+  const callValue = row => query.basis === 'total' ? row.cost : query.basis === 'plan' ? Math.max(0, row.cost - row.apiCost) : row.apiCost
+  callShares.sort((a, b) => callValue(b) - callValue(a) || a.index - b.index)
+  if (callShares.length > 7) {
+    const rest = { index: -1, cost: 0, apiCost: 0, tokens: 0, calls: 0, other: true, unpriced: false }
+    for (const row of callShares.splice(7)) {
+      for (const key of ['cost', 'apiCost', 'tokens', 'calls']) rest[key] += row[key]
+      rest.unpriced ||= row.unpriced
+    }
+    callShares.push(rest)
+  }
+  // Aggregate the complete selection before paging. Unknown round identities stay
+  // explicit; timing alone cannot reliably assign a search or compaction to a turn.
+  const kinds = new Map(), turns = new Map(), steps = new Map()
+  for (const sample of selected) {
+    for (const [map, key, identity] of [[kinds, sample.kind, { kind: sample.kind }], [turns, JSON.stringify([sample.sessionId, sample.turn]), { sessionId: sample.sessionId, turn: sample.turn }],
+      [steps, JSON.stringify([sample.sessionId, sample.turn, sample.step]), { sessionId: sample.sessionId, turn: sample.turn ?? null, step: sample.step ?? null, other: false }]] as const) {
+      const row = map.get(key) ?? { ...identity, ...emptyStats(), unpriced: false }
+      for (const bucket of Object.keys(fields)) row[bucket] += sample.buckets[bucket]
+      row.calls++; row.cost += sample.cost; row.apiCost += sample.apiCost
+      row.unpriced ||= !sample.resolved.priced
+      map.set(key, row)
+    }
+  }
+  const share = metric => {
+    const value = row => metric === 'calls' ? row.calls : query.basis === 'plan' ? row.cost - row.apiCost : query.basis === 'api' ? row.apiCost : row.cost
+    const all = [...steps.values()].sort((a, b) => value(b) - value(a) || b.calls - a.calls)
+    if (all.length <= 12) return all
+    const rest = { sessionId: '', turn: null, step: null, other: true, ...emptyStats(), unpriced: false }
+    for (const row of all.slice(12)) { for (const key of STAT_FIELDS) rest[key] += row[key]; rest.unpriced ||= row.unpriced }
+    return [...all.slice(0, 12), rest]
+  }
+  for (const row of emptyTurns) {
+    const key = JSON.stringify([row.sessionId, row.turn])
+    if (!turns.has(key)) turns.set(key, { ...row, ...emptyStats(), unpriced: false })
+  }
+  const order = new Map<string, number>([...ids].map((id, index) => [id, index]))
+  const orderedTurns = [...turns.values()].sort((a, b) => order.get(a.sessionId)! - order.get(b.sessionId)! || (a.turn ?? Infinity) - (b.turn ?? Infinity))
+  const recorded = emptyStats()
+  const agents = new Map([...ids].map(id => [id, { id, title: id, ...emptyStats() }]))
+  for (const [date, day] of Object.entries<DayRecord>(ledger.days)) {
+    if (date < query.from || date > query.to) continue
+    for (const session of day.sessions ?? []) {
+      if (!ids.has(session.id)) continue
+      const row = selectedStats(session, query), agent = agents.get(session.id)!
+      if (session.title) agent.title = session.title
+      for (const key of STAT_FIELDS) { recorded[key] += row[key]; agent[key] += row[key] }
+    }
+  }
+  // Limit transport size, not the totals or category breakdown. Every call is reachable by paging.
+  return { ...detail, agents: [...agents.values()], found: detail.found || orderedTurns.length > 0, calls: detail.calls.slice(query.offset, query.offset + 50), totalCalls: detail.calls.length, offset: query.offset, recorded,
+    kinds: [...kinds.values()], turns: orderedTurns.slice(query.turnOffset, query.turnOffset + 25), totalTurns: orderedTurns.length, turnOffset: query.turnOffset,
+    stepShares: { cost: share('cost'), calls: share('calls') }, callShares }
+}
