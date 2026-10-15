@@ -150,12 +150,14 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
     "build:host": "node scripts/build.mjs --host",
     "build:client": "node scripts/build.mjs --client",
     "typecheck": "tsc --noEmit",
     "dev": "node scripts/build.mjs --client",
     "test": "node --test test/*.mjs",
-    "pack": "npm pack --dry-run"
+    "pack": "npm pack --dry-run",
+    "prepack": "node scripts/build.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-credentials": "0.1.0-rc.8",

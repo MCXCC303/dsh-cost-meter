@@ -15,3 +15,8 @@ HANDOFF.md
 .hoplite/attachments/
 
 .local-backup-*/
+
+# 构建产物:src/ 是唯一真相源,lib/ 由 scripts/build.mjs 生成。
+# 产物入库会淹没 git 历史 —— 每次改动都带一堆编译输出 diff,真正的源码改动
+# 被埋在中间。npm 打包不受影响:package.json 的 files 里显式列了 lib。
+/lib/

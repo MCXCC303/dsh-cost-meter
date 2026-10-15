@@ -303,40 +303,40 @@ jobs:
       - name: Verify plugin joined the bundle graph
         shell: bash
         run: ${{ matrix.verify-cmd }}
-      # 回归与产物门禁需要工作区依赖(zod / dsh-credentials / dsh-home-paths / esbuild):
-      # 本 job 只做安装冒烟、从不装工作区依赖,故回归前按锁文件补装(pnpm v11.21 由
-      # install.ps1 在 Windows leg 供给、上一步在 Linux leg 显式安装)。--frozen-lockfile
-      # 保证 esbuild 与构建已提交 bundle 的 0.28.2 严格一致,产物比对逐字节可复现。
+      # 回归与产物门禁需要工作区依赖(zod / dsh-credentials / dsh-home-paths /
+      # esbuild / tsdown / typescript):本 job 只做安装冒烟、从不装工作区依赖,
+      # 故按锁文件补装(--frozen-lockfile 保证构建工具版本严格一致、产物可复现)。
       - name: Install workspace dependencies
         shell: bash
         run: pnpm install --frozen-lockfile
+
+      # 类型门禁:src/** 全为 TypeScript(strict),任何类型错误都必须让 CI 变红。
+      - name: Typecheck (tsc --noEmit)
+        shell: bash
+        run: npx tsc --noEmit --pretty false
+
+      # 构建门禁:lib/ 是构建产物,**不再提交进 git**(产物入库会淹没历史,且每次
+      # 改动都产生一堆无意义的编译输出 diff)。改为「必须能从 src 干净构建出全部
+      # 产物」——构建失败或缺产物即红。
+      #
+      # 产物形态:宿主走 tsdown(Node ESM + .d.ts),浏览器走 esbuild 的
+      # 「启动包 + 按需分块」,共 7 个 JS 产物。
+      - name: Build artifacts from src
+        shell: bash
+        run: |
+          node scripts/build.mjs
+          for artifact in lib/index.js lib/typert.js lib/client.js \
+                         lib/client.peak.js lib/client.settings.js \
+                         lib/client.statistics.js lib/client.openrouter.js; do
+            test -s "$artifact" || { echo "missing artifact: $artifact"; exit 1; }
+          done
+
       # 回归门禁(v1.6.8):CI 此前只验证「能装上」,不验证「算得对」——
       # verify.mjs 回归套件(定价数学/峰谷边界/账本回归/端点白名单)此前完全靠人工执行。
+      # 必须在构建之后:测试断言的是构建产物,而产物不再入库。
       - name: Run regression suite
         shell: bash
         run: |
           export DSH_TEST_NODE_MODULES="$PWD/.tmp-install-host/node_modules"
           node test/verify.mjs
           node test/market-hot-install.mjs
-      # 产物漂移门禁(v1.6.8):lib/ 下是提交进仓库的构建产物,无 prepare/prepack
-      # 钩子,全靠手工构建后提交,此前实测已发生漂移。此处重新构建并比对,任何未提交
-      # 的产物差异都会让 CI 变红,杜绝把过期产物发布出去。
-      #
-      # 重构后产物形态:宿主走 tsdown(Node ESM + .d.ts),浏览器走 esbuild 的
-      # 「启动包 + 按需分块」。校验覆盖全部 7 个 JS 产物;.d.ts / .js.map 同样
-      # 提交,一并比对,避免类型声明与 JS 产物不同步。
-      - name: Check build artifacts are in sync with src
-        shell: bash
-        run: |
-          node scripts/build.mjs
-          git diff --exit-code \
-            lib/index.js lib/index.d.ts lib/index.js.map \
-            lib/typert.js lib/typert.d.ts lib/typert.js.map \
-            lib/client.js \
-            lib/client.peak.js lib/client.settings.js \
-            lib/client.statistics.js lib/client.openrouter.js
-
-      # 类型门禁:重构后 src/** 全为 TypeScript(strict),任何类型错误都必须让 CI 变红。
-      - name: Typecheck (tsc --noEmit)
-        shell: bash
-        run: npx tsc --noEmit --pretty false
