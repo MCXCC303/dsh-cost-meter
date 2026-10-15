@@ -74,6 +74,7 @@ export const css: string = [
       // 顶栏:界面语言等即时可见项,右对齐。
       '.cm-toolbar{display:flex;justify-content:flex-end;align-items:center;gap:10px}',
       '.cm-toolbar .cm-field{flex-direction:row;align-items:center;gap:8px}',
+      '.cm-toolbar .cm-field>.cm-input{width:auto}',
       '.cm-toolbar .cm-field label{margin:0;font-size:12px;color:var(--dsw-alias-label-tertiary)}',
       '.cm-toolbar .cm-input{min-width:150px;padding:4px 10px}',
       // 设置页标签栏(issue #29):左侧分组标签,右侧常驻自动保存状态。
@@ -95,9 +96,19 @@ export const css: string = [
       '.cm-sess-id{font-size:11px;font-family:ui-monospace,Consolas,monospace;color:var(--dsw-alias-label-tertiary)}',
       '.cm-empty{font-size:12px;color:var(--dsw-alias-label-tertiary);padding:8px 0}',
       '.cm-scroll{max-height:320px;overflow:auto;border:1px solid var(--dsw-alias-border-l1);border-radius:10px}',
-      '.cm-grid{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:12px}',
+      // 设置项一律线性单列:标签在上、控件在下、控件占满同一条宽度。
+      // 早先排成两列时,各格高度不同(复选框一行、下拉两行)导致左右错位,
+      // 视觉上像散落的表单碎片;单列后阅读顺序与视觉顺序一致,也便于按分区归组。
+      '.cm-grid{display:flex;flex-direction:column;gap:14px}',
       '.cm-field{display:flex;flex-direction:column;gap:6px}',
       '.cm-field label{font-size:12px;color:var(--dsw-alias-label-secondary)}',
+      // 控件宽度统一:一行一个控件,narrow 控件保留自身上限。
+      '.cm-field>.cm-input,.cm-field>.cm-btn{width:100%;box-sizing:border-box}',
+      '.cm-field>.cm-input.narrow{width:100%;max-width:160px}',
+      // 复选框行:勾选块与文字同排,不再把文字折到独立的一行。
+      '.cm-check{display:flex;align-items:center;gap:8px;min-height:20px}',
+      '.cm-check input{margin:0;flex:none}',
+      '.cm-check span{min-width:0}',
       // #258: 原生下拉选项不会继承 select 的背景；皮肤为深色、宿主仍为浅色时会出现白字白底。
       '.cm-input,.cm-input option{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base)}.cm-input{font:inherit;font-size:13px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:6px 10px;outline:none}',
       '.cm-input:focus{border-color:var(--dsw-alias-state-business-primary)}',
@@ -194,8 +205,11 @@ export const css: string = [
       '.cm-peak-rail-classic.off .cm-peak-rail-classic-marker{border-color:var(--dsw-alias-state-business-primary)}',
       '.cm-peak-rail-classic-label{font-size:10px;font-weight:600;line-height:1.2;white-space:nowrap}',
       '.cm-peak-rail-classic.weekend .cm-peak-rail-classic-marker{border-color:#34a853}',
-      '.cm-grid-group{grid-column:1 / -1;margin-top:8px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-tertiary);border-bottom:1px solid var(--dsw-alias-border-l1);padding-bottom:4px}',
+      // 分区标题:线性布局里它就是「一段」的开头,做足分隔感。
+      '.cm-grid-group{margin-top:18px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-tertiary);letter-spacing:.04em;border-bottom:1px solid var(--dsw-alias-border-l1);padding-bottom:6px}',
       '.cm-grid-group:first-child{margin-top:0}',
+      // 分区内的第一个字段紧跟标题,不再叠加纵向间距。
+      '.cm-grid-group+.cm-field{margin-top:-6px}',
       '.cm-peak-preview{margin-top:8px}',
       '.cm-toggle-btn{background:none;border:none;padding:0;font-size:12px;font-weight:600;color:var(--dsw-alias-state-business-primary);cursor:pointer}',
       '.cm-toggle-btn:hover{text-decoration:underline}',
@@ -330,5 +344,5 @@ export const css: string = [
       '.cm-footer-stack.simple.rail{border:0;background:transparent}',
       '.cm-footer-stack.simple.rail .cm-bbox{padding:4px 2px}',
       '.cm-footer-stack.simple .cm-peak-rail-track,.cm-footer-stack.simple .cm-peak-rail-classic-track{height:28px}',
-      '@media (max-width:640px){.cm-cards{grid-template-columns:1fr}.cm-grid{grid-template-columns:1fr}.cm-budget-controls{grid-template-columns:1fr}}',
+      '@media (max-width:640px){.cm-cards{grid-template-columns:1fr}.cm-budget-controls{grid-template-columns:1fr}}',
     ].join('\n')
