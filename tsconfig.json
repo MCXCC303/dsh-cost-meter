@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+
+    "strict": true,
+    // 迁移过渡:未标注的形参先按 any 放行(约数百处),后续分批收敛。
+    // 其余 strict 规则(strictNullChecks / 函数类型等)保持开启,能抓真实缺陷。
+    // TODO(refactor): 收敛完毕后改回 true。
+    "noImplicitAny": false,
+    "noImplicitOverride": true,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": false,
+
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "lib", "dist"]
+}

@@ -9,13 +9,15 @@
   },
   "exports": {
     ".": {
+      "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": {
       "default": "./lib/client.js"
     },
     "./typert": {
-      "default": "./lib/typert.host.js"
+      "types": "./lib/typert.d.ts",
+      "default": "./lib/typert.js"
     },
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
@@ -148,11 +150,19 @@
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node test/verify.mjs"
+    "build:host": "node scripts/build.mjs --host",
+    "build:client": "node scripts/build.mjs --client",
+    "typecheck": "tsc --noEmit",
+    "dev": "node scripts/build.mjs --client",
+    "test": "node --test test/*.mjs",
+    "pack": "npm pack --dry-run"
   },
   "devDependencies": {
     "@deepseek-ai/dsh-credentials": "0.1.0-rc.8",
     "@deepseek-ai/dsh-home-paths": "0.1.0-rc.8",
-    "esbuild": "^0.28.2"
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "tsdown": "^0.23.1",
+    "typescript": "^7.0.2"
   }
 }
