@@ -61,7 +61,10 @@ async function buildHost() {
     fixedExtension: false,
     dts: true,
     sourcemap: true,
-    minify: true,
+    // 不压缩:旧构建交付的就是可读 ESM,仓库里大量断言(verify.mjs)按源码原文
+    // 在 lib/index.js 里找行为证据;压缩会把标识符改名,让这些断言失去意义。
+    // 本分支不受 256 KiB 限制,体积不敏感。
+    minify: false,
     clean: false,
     external: ['zod', /^@deepseek-ai\//],
   })
@@ -109,11 +112,15 @@ async function buildClient() {
   }
 }
 
-// 清理上一版分块产物,避免旧文件被 require.async 命中。
-for (const name of readdirSync(resolve(projectRoot, 'lib'))) {
-  if (/^client(\.[a-z]+)?\.js(\.map)?$/.test(name)) rmSync(resolve(projectRoot, 'lib', name), { force: true })
+// 只清理**本次要构建的那一半**的上一版产物,避免旧文件被 require.async 命中。
+// 不能无条件清:`--host` 会把客户端产物删掉,`--client` 会把宿主产物删掉,
+// 局部构建等于毁掉另一半(曾踩过:`node scripts/build.mjs --host` 之后
+// lib/client*.js 全没了,依赖它们的测试直接 ENOENT)。
+if (only !== 'host') {
+  for (const name of readdirSync(resolve(projectRoot, 'lib'))) {
+    if (/^client(\.[a-z]+)?\.js(\.map)?$/.test(name)) rmSync(resolve(projectRoot, 'lib', name), { force: true })
+  }
 }
-
 if (only !== 'client') await buildHost()
 if (only !== 'host') await buildClient()
 console.log('✓ 构建完成')
