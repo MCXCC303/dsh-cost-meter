@@ -2,18 +2,40 @@ import assert from 'node:assert/strict'
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build } from 'esbuild'
 import { defaultConfig, sanitizeConfig, zeroDay, localDayKey, Ledger } from '../lib/store.js'
 
 // Optional paths let the matcher patch be checked before applying it to the repository.
 const pricingUrl = process.argv[2] ? pathToFileURL(resolve(process.argv[2])) : new URL('../lib/pricing.js', import.meta.url)
-const clientUrl = process.argv[3] ? pathToFileURL(resolve(process.argv[3])) : new URL('../src/client/02-validators-helpers-sidebar.js', import.meta.url)
+// 客户端计价镜像来自 src/client/logic.ts:构建产物(lib/client*.js)只导出启动/分块入口,
+// 这些内部符号不对外导出,故用 esbuild 现场打成临时 CJS 再 require(NodeNext 的 `.js`
+// 后缀导入也只有打包器能解析)。传入补丁文件时同一路径生效。
+const clientSource = process.argv[3] ? resolve(process.argv[3]) : fileURLToPath(new URL('../src/client/logic.ts', import.meta.url))
 const { providerPriceEntryFor, matchModelId, normalizePrice } = await import(pricingUrl)
-const source = readFileSync(clientUrl, 'utf8')
-const start = source.indexOf('function priceEntryFor(modelId, table)')
-const end = source.indexOf('function makeStore(initial,')
-assert.ok(start >= 0 && end > start)
-const client = new Function(source.slice(start, end) + '\nreturn { resolveClientPrice, matchModelIdLocal }')()
+const client = await loadClientMirror(clientSource)
+
+/**
+ * 现场打包客户端计价镜像并取回 { resolveClientPrice, matchModelIdLocal }。
+ * 传非模块脚本(历史补丁片段)时回落到按源码切片求值,保住补丁自检路径。
+ */
+async function loadClientMirror(path) {
+  const work = mkdtempSync(join(tmpdir(), 'cm-client-bundle-'))
+  try {
+    const outfile = join(work, 'client.cjs')
+    await build({ entryPoints: [path], bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent' })
+    const mod = await import(pathToFileURL(outfile).href)
+    const bundled = mod.default ?? mod
+    if (typeof bundled.resolveClientPrice === 'function' && typeof bundled.matchModelIdLocal === 'function') return bundled
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+  const source = readFileSync(path, 'utf8')
+  const start = source.indexOf('function priceEntryFor(modelId, table)')
+  const end = source.indexOf('function makeStore(initial,')
+  assert.ok(start >= 0 && end > start)
+  return new Function(source.slice(start, end) + '\nreturn { resolveClientPrice, matchModelIdLocal }')()
+}
 
 const flat = (input, output = input * 5) => ({ input, output, billingMode: 'flat' })
 const directDeepSeek = { cacheMiss: 0.15, cacheHit: 0.003, output: 0.6, billingMode: 'deepseek-peak' }

@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
+import { build } from 'esbuild'
 import {
   CODING_PLAN_PROVIDERS,
   CODING_PLAN_PROVIDER_IDS,
@@ -137,17 +138,59 @@ assert.equal(normalized.display, 'settings')
 assert.equal(normalized.refreshMinutes, 15)
 
 // ── 双端接线存在性:i18n(中英)、设置卡片行、客户端别名镜像、Cookie 说明 ──
-const i18nSrc = readFileSync(resolve(root, 'src/client/01-open-styles-i18n.js'), 'utf8')
-for (const key of ['codingPlanMimo:', 'mimoWindowPlan', 'mimoWindowCompensation', 'codingPlanWindowBalance']) {
-  assert.equal(i18nSrc.split(key).length - 1, 2, `i18n key ${key} 应在中英两处出现`)
+// 旧客户端片段已删除,改为:用户可见文案查构建产物(lib/client.js / lib/client.settings.js),
+// 产物未导出的内部符号(别名镜像、横条短标签、窗口标签映射、i18n 词典、设置卡片行)用
+// esbuild 现场把对应源打成 CJS 再执行取回。断言口径不变,取符号来源见注释。
+const mainArtifact = readFileSync(resolve(root, 'lib/client.js'), 'utf8')
+const settingsArtifact = readFileSync(resolve(root, 'lib/client.settings.js'), 'utf8')
+assert.ok(settingsArtifact.includes('Cookie (platform.xiaomimimo.com)'), '设置页 MiMo 卡片保留 Cookie 说明')
+
+const clientProbe = await build({
+  stdin: {
+    contents: `
+      export { MESSAGES } from './src/client/i18n-messages.js'
+      export { PLAN_PROVIDER_ALIASES_LOCAL, planProviderIdOfLocal } from './src/client/logic.js'
+      export { STRIP_VENDOR_SHORT, codingPlanWindowLabel } from './src/client/ui-quota.js'
+      export { CODING_PLAN_ROWS } from './src/client/settings.js'
+    `,
+    loader: 'ts',
+    resolveDir: root,
+  },
+  bundle: true, write: false, format: 'cjs', platform: 'node', target: 'node22', logLevel: 'silent',
+  // 平台种子只在与组件求值相关时才需要,这里给最小桩;纯符号不触碰它们。
+  external: ['react', 'react-dom', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives'],
+})
+const seedStub = {
+  react: { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), Fragment: 'Fragment', useState: value => [typeof value === 'function' ? value() : value, () => {}], useEffect() {}, useRef: value => ({ current: value }) },
+  'react-dom': { createPortal: children => children },
+  'react/jsx-runtime': { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }), Fragment: 'Fragment' },
+  '@deepseek-ai/dsh-client-ui-primitives': { Tooltip: 'Tooltip', Button: 'Button' },
 }
-const panelsSrc = readFileSync(resolve(root, 'src/client/03-settings-panels-main.js'), 'utf8')
-assert.ok(panelsSrc.includes("{ id: 'mimo', labelKey: 'codingPlanMimo' }"))
-assert.ok(panelsSrc.includes('Cookie (platform.xiaomimimo.com)'))
-const sidebarSrc = readFileSync(resolve(root, 'src/client/02-validators-helpers-sidebar.js'), 'utf8')
-assert.ok(sidebarSrc.includes('xiaomi-token-plan-cn')) // PLAN_PROVIDER_ALIASES_LOCAL 镜像
-assert.ok(sidebarSrc.includes("mimo: 'MiMo'")) // 额度横条短标签
-assert.ok(sidebarSrc.includes("t('mimoWindowPlan')")) // 窗口标签映射
+const clientModule = { exports: {} }
+new Function('require', 'module', 'exports', clientProbe.outputFiles[0].text)(id => {
+  if (id in seedStub) return seedStub[id]
+  throw new Error('mimo-quota: 缺少种子模块 ' + id)
+}, clientModule, clientModule.exports)
+const client = clientModule.exports
+
+// i18n:旧检查在 i18n 片段里对每个键计数 2(中英各一处),这里直接查两本词典。
+for (const key of ['codingPlanMimo', 'mimoWindowPlan', 'mimoWindowCompensation', 'codingPlanWindowBalance']) {
+  assert.ok(client.MESSAGES.zh[key], `i18n key ${key} 缺少中文`)
+  assert.ok(client.MESSAGES.en[key], `i18n key ${key} 缺少英文`)
+}
+// 设置卡片行(旧检查:{ id: 'mimo', labelKey: 'codingPlanMimo' })。
+assert.ok(client.CODING_PLAN_ROWS.some(row => row.id === 'mimo' && row.labelKey === 'codingPlanMimo'))
+// 客户端别名镜像(旧检查:侧栏片段含 xiaomi-token-plan-cn)。
+assert.ok(client.PLAN_PROVIDER_ALIASES_LOCAL.mimo.includes('xiaomi-token-plan-cn'))
+assert.equal(client.planProviderIdOfLocal('LLM-Xiaomi-Token-Plan-CN'), 'mimo')
+// 额度横条短标签(旧检查:mimo: 'MiMo')。
+assert.equal(client.STRIP_VENDOR_SHORT.mimo, 'MiMo')
+// 窗口标签映射(旧检查:t('mimoWindowPlan'))。
+const identity = key => key
+assert.equal(client.codingPlanWindowLabel('plan', identity), 'mimoWindowPlan')
+assert.equal(client.codingPlanWindowLabel('compensation', identity), 'mimoWindowCompensation')
+assert.equal(client.codingPlanWindowLabel('balance', identity), 'codingPlanWindowBalance')
+assert.ok(mainArtifact.includes('MiMo'), '启动包内含 MiMo 横条短标签')
 
 // Exercise failed/optional responses and cancellation without contacting an account.
 const originalFetch = globalThis.fetch
