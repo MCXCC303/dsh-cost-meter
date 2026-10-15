@@ -1,15 +1,45 @@
 // 账号渠道余额:DSH 桌面版登录官方账号后钱包由宿主账号服务持有(deepseekAccount),
 // 用户通常不保存开放平台 Key;本文件驱动真实 apply() 服务验证来源优先级与失败语义。
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { apply } from '../lib/index.js'
 import { stateSchema } from '../lib/typert.host.js'
 import { setImmediate as tick } from 'node:timers/promises'
-import vm from 'node:vm'
 import { Ledger, localDayKey, officialCostOfDay } from '../lib/store.js'
 import { mergeLedger } from '../lib/ledger-persistence.js'
+import { loadChunk } from './helpers/load-artifact.mjs'
+
+/**
+ * 现场打包客户端模块:产物只导出启动/分块入口,ui-balance 等内部符号不可见,
+ * 而源码已是 ES 模块(export/类型标注),不能再按片段拼接求值。
+ * React 用打包期替身(本文件只取组件树与纯函数,不真渲染)。
+ */
+async function loadClientModule(name) {
+  const work = mkdtempSync(join(tmpdir(), `cm-account-${name}-`))
+  try {
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const React = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), Fragment: "Fragment",'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useContext: () => undefined, createContext: () => ({ Provider: null, Consumer: null }),'
+      + ' forwardRef: fn => fn, memo: fn => fn }\nmodule.exports = React\nmodule.exports.default = React\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const outfile = join(work, `${name}.cjs`)
+    await esbuild({
+      entryPoints: [fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url))],
+      bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+    })
+    const mod = await import(pathToFileURL(outfile).href)
+    return mod.default ?? mod
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
 
 const root = mkdtempSync(join(tmpdir(), 'cm-account-balance-'))
 const envNames = ['DSH_HOME', 'DEEPSEEK_BASE_URL', 'DEEPSEEK_API_KEY', 'DSH_DEEPSEEK_API_KEY', 'DEEPSEEK_BALANCE_API_KEY']
@@ -378,13 +408,21 @@ try {
   reconciled.dispose()
 
   // Execute the actual client components against a failed RPC snapshot in both languages.
-  const dir = new URL('../src/client/', import.meta.url)
-  const source = readdirSync(dir).filter(n => n.endsWith('.js')).sort().map(n => readFileSync(new URL(n, dir), 'utf8')).join('')
-  let factory
-  vm.runInNewContext(source.replace('exports.apply = apply', 'exports.test = { BalanceRowContent, BalancePanel, makeT, todayOfficialUsd, segmentsForOfficialBalance }; exports.apply = apply'), { window: { __ModuleLoader__: { load: v => { factory = v.factory } }, localStorage: { getItem: () => null } }, navigator: { language: 'en' } })
+  // 客户端已迁 TS 模块且旧片段已删:组件按平台路径从构建产物取(BalancePanel 属 settings
+  // 分块),内部助手用 esbuild 现场打包 src/client/ui-balance.ts / t.ts(产物不导出这些符号)。
   const el = (type, props, ...children) => ({ type, props: props ?? {}, children })
   const React = { createElement: el, Fragment: 'fragment', useState: init => [typeof init === 'function' ? init() : init, () => {}], useEffect() {}, useRef: value => ({ current: value }), useCallback: fn => fn }
-  const ui = factory(name => name === 'react' ? React : { Tooltip: 'tooltip' }).test
+  const settingsChunk = await loadChunk('client.settings.js', { react: React })
+  const balanceModule = await loadClientModule('ui-balance')
+  const tModule = await loadClientModule('t')
+  const ui = {
+    BalanceRowContent: balanceModule.BalanceRowContent,
+    BalancePanel: settingsChunk.BalancePanel,
+    makeT: tModule.makeT,
+    todayOfficialUsd: balanceModule.todayOfficialUsd,
+    segmentsForOfficialBalance: balanceModule.segmentsForOfficialBalance,
+  }
+  for (const [name, value] of Object.entries(ui)) assert.equal(typeof value, 'function', '客户端组件/助手可取: ' + name)
   assert.ok(Math.abs(ui.todayOfficialUsd({ today: accountToday }) - 1.4) < 1e-12, '余额条与服务端对账累计同一组账号调用')
   const accountSegments = ui.segmentsForOfficialBalance({ ...accountResult.state, balance: { totalBalance: 80, currency: 'CNY' } }, { exchangeRate: 7.2, balance: { budgetCap: 100 } })
   const usdSegments = ui.segmentsForOfficialBalance({ ...accountResult.state, balance: { totalBalance: 80, currency: 'USD' } }, { exchangeRate: 7.2, balance: { budgetCap: 100 } })

@@ -1,24 +1,83 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { Ledger, sanitizeConfig, applyConfigPatch } from '../lib/store.js'
 import { stateSchema } from '../lib/typert.host.js'
 
-const dir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(dir).filter(n => n.endsWith('.js')).sort().map(n => readFileSync(new URL(n, dir), 'utf8')).join('')
-let factory, hookIndex = 0, hooks = []
+/**
+ * 现场打包客户端模块:旧片段已删、源码已是 ES 模块。React/浏览器 API 通过
+ * globalThis.__cmReactStub / __cmEnv 桥接本文件的桩(banner 在实例化时绑定到模块作用域,
+ * 不污染宿主与同进程其它测试);parseConfig 未 export,打包时追加等价 export。
+ */
+const CLIENT_ENV_BANNER = 'const __cmEnv = globalThis.__cmEnv ?? {}\n'
+  + 'const Date = __cmEnv.Date ?? globalThis.Date\n'
+  + 'const window = __cmEnv.window\n'
+  + 'const document = __cmEnv.document\n'
+  + 'const navigator = __cmEnv.navigator ?? globalThis.navigator\n'
+  + 'const fetch = __cmEnv.fetch\n'
+  + 'const setTimeout = __cmEnv.setTimeout\n'
+  + 'const clearTimeout = __cmEnv.clearTimeout\n'
+  + 'const setInterval = __cmEnv.setInterval\n'
+  + 'const clearInterval = __cmEnv.clearInterval\n'
+  + 'const AbortSignal = __cmEnv.AbortSignal ?? globalThis.AbortSignal\n'
+async function loadClientModules(modules, exposePrivate = {}) {
+  const work = mkdtempSync(join(tmpdir(), 'cm-sidebar-simple-'))
+  try {
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const base = { Fragment: "Fragment", createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useSyncExternalStore: (_sub, get) => get() }\n'
+      + 'const R = Object.assign({}, base, globalThis.__cmReactStub ?? {})\nmodule.exports = R\nmodule.exports.default = R\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const entry = join(work, 'entry.ts')
+    writeFileSync(entry, modules.map(name => `export * from ${JSON.stringify(fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url)))}\n`).join(''))
+    const outfile = join(work, 'bundle.cjs')
+    await esbuild({
+      entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      banner: { js: CLIENT_ENV_BANNER },
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+      plugins: [{
+        name: 'expose-private',
+        setup(build) {
+          for (const [moduleName, names] of Object.entries(exposePrivate)) {
+            build.onLoad({ filter: new RegExp(`${moduleName}\\.ts$`) }, args => {
+              const source = readFileSync(args.path, 'utf8')
+              const missing = names.filter(name => !new RegExp(`export (?:function|const|let|class) ${name}\\b`).test(source))
+              return { contents: missing.length > 0 ? source + `\nexport { ${missing.join(', ')} }\n` : source, loader: 'ts' }
+            })
+          }
+        },
+      }],
+    })
+    const mod = await import(pathToFileURL(outfile).href)
+    return mod.default ?? mod
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
+
+let hookIndex = 0, hooks = []
 const storage = new Map()
-vm.runInNewContext(source.replace('exports.apply = apply', 'exports.test = { SidebarSimpleGuide, QuotaStripGuide, BalanceClickGuide, SidebarFooter, parseConfig, codexQuotaCache }; exports.apply = apply'), {
-  navigator: { language: 'en' }, window: { __ModuleLoader__: { load: v => { factory = v.factory } }, localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) } },
-})
 const el = (type, props, ...children) => ({ type, props: props ?? {}, children })
 const React = { createElement: el, Fragment: 'fragment', useEffect() {},
   useRef: value => { const i = hookIndex++; return hooks[i] ??= { current: value } },
   useState: init => { const i = hookIndex++; if (!(i in hooks)) hooks[i] = typeof init === 'function' ? init() : init; return [hooks[i], value => { hooks[i] = value }] },
 }
-const ui = factory(name => name === 'react' ? React : { Tooltip: 'tooltip' }).test
+// 旧 vm 沙箱的等价物:客户端模块读到的 window.localStorage / navigator 由本环境的
+// __cmEnv 提供(banner 在实例化时绑定),不再改写进程全局。
+globalThis.__cmReactStub = React
+globalThis.__cmEnv = {
+  window: { localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) } },
+  navigator: { language: 'en' },
+}
+const ui = await loadClientModules(['logic', 'guides', 'ui-quota', 'ui-sidebar'], { logic: ['parseConfig'] })
+for (const name of ['SidebarSimpleGuide', 'QuotaStripGuide', 'BalanceClickGuide', 'SidebarFooter', 'parseConfig', 'codexQuotaCache']) {
+  assert.ok(ui[name] !== undefined, '客户端组件/助手可取: ' + name)
+}
 const nodes = n => Array.isArray(n) ? n.flatMap(nodes) : n && typeof n === 'object' ? [n, ...nodes(n.children)] : []
 const base = sanitizeConfig({ sidebarStyle: 'compact', quotaStrip: { promptSeen: true }, balance: { clickHintSeen: true }, hideOfficialBalance: true, goQuota: { enabled: false } })
 assert.equal(base.sidebarSimple, false, '旧配置保留当前布局')

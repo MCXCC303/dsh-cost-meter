@@ -12,13 +12,33 @@
 //   C. 页面没有任何样式表 → 新建并插入 head。
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 
-const dir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(dir).filter(name => name.endsWith('.js')).sort()
-  .map(name => readFileSync(new URL(name, dir), 'utf8')).join('')
+// 旧 src/client/*.js 拼接片段已删:样式注入现在发生在**启动包产物**的模块初始化里
+// (index.ts 顶层的 `createStyleTag()`)。这里按平台 classic-script 语义执行 lib/client.js:
+// 脚本只注册 factory,再用种子 require 调 factory —— 模块体副作用(注入样式)在此时发生。
+const artifact = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+const reactStub = {
+  createElement: () => null, Fragment: 'fragment',
+  useState: value => [typeof value === 'function' ? value() : value, () => {}],
+  useEffect() {}, useRef: value => ({ current: value ?? null }),
+}
 
-/** 用一棵最小的假 DOM 跑一次客户端片段,返回它写进 head 的样式节点。 */
+/** 按平台语义执行启动包产物:注册 factory → 用种子 require 调 factory。 */
+function runStartup(doc) {
+  let factory
+  vm.runInNewContext(artifact, {
+    window: { __ModuleLoader__: { load: value => { factory = value.factory } } },
+    document: doc, navigator: { language: 'en' },
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0, clearTimeout: () => {},
+    requestAnimationFrame: () => 0, CustomEvent: class {}, Event: class {}, console,
+  })
+  assert.ok(typeof factory === 'function', 'client bundle registers a factory')
+  factory(id => id === 'react' ? reactStub : { Tooltip: 'Tooltip' })
+}
+
+/** 用一棵最小的假 DOM 跑一次启动包,返回它写进 head 的样式节点。 */
 function inject({ existing = null } = {}) {
   const appended = []
   const node = existing ?? { dataset: {}, textContent: '' }
@@ -33,30 +53,18 @@ function inject({ existing = null } = {}) {
     },
     createElement: () => ({ dataset: {}, textContent: '' }),
   }
-  let factory
-  vm.runInNewContext(source, {
-    window: { __ModuleLoader__: { load: value => { factory = value.factory } } },
-    document: doc, navigator: { language: 'en' },
-  })
-  assert.ok(typeof factory === 'function', 'client bundle registers a factory')
-  factory(() => ({}))
+  runStartup(doc)
   return { node, appended }
 }
 
-// 取出注入的样式文本:source 里 css 是常量数组,实现必须写到节点上。
+// 取出注入的样式文本:实现必须写到节点上。
 const runtime = (() => {
-  let factory
   const style = { dataset: {}, textContent: '' }
-  vm.runInNewContext(source, {
-    window: { __ModuleLoader__: { load: value => { factory = value.factory } } },
-    document: {
-      head: { appendChild() {} },
-      querySelector: () => null,
-      createElement: () => style,
-    },
-    navigator: { language: 'en' },
+  runStartup({
+    head: { appendChild() {} },
+    querySelector: () => null,
+    createElement: () => style,
   })
-  factory(() => ({}))
   return style.textContent
 })()
 assert.ok(runtime.includes('.cm-stat-dialog'), 'injected stylesheet carries the dialog positioning rule')

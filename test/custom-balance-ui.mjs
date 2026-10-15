@@ -1,14 +1,55 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { readFileSync, readdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { sanitizeConfig, applyConfigPatch } from '../lib/store.js'
 
+/**
+ * 现场打包客户端模块:旧片段已删、源码已是 ES 模块(export/类型标注),不能再拼接求值;
+ * 产物只导出启动/分块入口,故按需 import 真实模块源码。
+ * React 用 globalThis.__cmReactStub 桥接本文件的桩 —— 组件在本文件里被直接调用,
+ * hook 槽位/元素形态必须与本文件的桩完全一致(否则展开/编辑等状态化渲染失真)。
+ */
+async function loadClientModules(modules, exposePrivate = {}) {
+  const work = mkdtempSync(join(tmpdir(), 'cm-custom-balance-'))
+  try {
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const base = { Fragment: "Fragment", createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useContext: () => undefined, useReducer: (r, init) => [init, () => {}],'
+      + ' createContext: () => ({ Provider: null, Consumer: null }), forwardRef: fn => fn, memo: fn => fn, useSyncExternalStore: (_sub, get) => get() }\n'
+      + 'const R = Object.assign({}, base, globalThis.__cmReactStub ?? {})\nmodule.exports = R\nmodule.exports.default = R\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const entry = join(work, 'entry.ts')
+    writeFileSync(entry, modules.map(name => `export * from ${JSON.stringify(fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url)))}\n`).join(''))
+    const outfile = join(work, 'bundle.cjs')
+    await esbuild({
+      entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+      plugins: [{
+        name: 'expose-private',
+        setup(build) {
+          for (const [moduleName, names] of Object.entries(exposePrivate)) {
+            build.onLoad({ filter: new RegExp(`${moduleName}\\.ts$`) }, args => {
+              const source = readFileSync(args.path, 'utf8')
+              const missing = names.filter(name => !new RegExp(`export (?:function|const|let|class) ${name}\\b`).test(source))
+              return { contents: missing.length > 0 ? source + `\nexport { ${missing.join(', ')} }\n` : source, loader: 'ts' }
+            })
+          }
+        },
+      }],
+    })
+    const mod = await import(pathToFileURL(outfile).href)
+    return mod.default ?? mod
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
+
 // 执行真实客户端组件及回调：覆盖新增、展开、凭据输入、删除与读取币种。
-// 仅在测试 VM 中暴露闭包函数，不在发布 bundle 中增加测试接口。
-const dir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(dir).filter(name => name.endsWith('.js')).sort().map(name => readFileSync(new URL(name, dir), 'utf8')).join('')
-const code = source.replace('exports.apply = apply', 'exports.test = { QuotasSection, CustomBalanceEntryPanel, CustomBalanceEntryRow, CustomBalanceEntryBox, customBalanceUnitOf, formatCustomBalanceMoney, segmentsForCustomBalance, customBalanceDetailText, parseConfig, makeT, fixedAmount }; exports.apply = apply')
-let factory
 let slots = []
 let cursor = 0
 const react = {
@@ -36,8 +77,11 @@ function verifyCreditsUI() {
   assert.ok(!detail.includes('10000'))
   assert.equal(ui.parseConfig(config, 'config').customBalances[0].unit, 'CREDITS')
 }
-vm.runInNewContext(code, { window: { __ModuleLoader__: { load: value => { factory = value.factory } } }, navigator: { language: 'en' } })
-const ui = factory(name => name === 'react' ? react : {}).test
+globalThis.__cmReactStub = react
+const ui = await loadClientModules(['logic', 't', 'ui-balance', 'ui-custom-balance', 'settings'], { logic: ['parseConfig'] })
+for (const name of ['QuotasSection', 'CustomBalanceEntryPanel', 'CustomBalanceEntryRow', 'CustomBalanceEntryBox', 'customBalanceUnitOf', 'formatCustomBalanceMoney', 'segmentsForCustomBalance', 'customBalanceDetailText', 'parseConfig', 'makeT', 'fixedAmount']) {
+  assert.equal(typeof ui[name], 'function', '客户端符号可取: ' + name)
+}
 // 额度区统一后卡片外壳为 QuotaCard 组件:渲染时多展开一层,拿到内部节点。
 const render = (component, props) => {
   cursor = 0

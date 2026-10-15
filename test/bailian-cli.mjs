@@ -392,8 +392,10 @@ process.stdout.write(spec.raw ?? JSON.stringify(spec.payload ?? {}));
   assert.equal(count(), disabledCount, 'reload with display=off spawns nothing')
 
   // 设置客户端哨兵:第三选项与双语 note 已进入打包产物。
+  // 设置面板现按需分块(旧单包已拆):下拉选项在 client.settings.js,词典仍在 client.js。
   const clientSrc = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
-  assert.ok(clientSrc.includes('value:"bailian"'), '额度来源下拉含百炼第三项')
+  const settingsSrc = readFileSync(new URL('../lib/client.settings.js', import.meta.url), 'utf8')
+  assert.ok(settingsSrc.includes('value:"bailian"'), '额度来源下拉含百炼第三项')
   assert.ok(clientSrc.includes('qwenBailianNote') && clientSrc.includes('qwenSourceBailian'), '百炼双语文案存在')
 
   setResponse({ login: { wait: 5000 } })

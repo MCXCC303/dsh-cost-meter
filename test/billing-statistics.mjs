@@ -116,7 +116,12 @@ try {
   let factory
   const react = { createElement() {}, useEffect() {}, useState() {} }
   vm.runInNewContext(readFileSync(new URL('../lib/client.statistics.js', import.meta.url), 'utf8'), { window: { __ModuleLoader__: { load: value => { assert.equal(value.chunk, 'client.statistics.js'); factory = value.factory } } } })
-  const client = factory(id => { assert.equal(id, 'react'); return react })
+  const client = (() => {
+    // 统计分块现用 createPortal 渲染上下文费用:除 react 外还需要平台种子 react-dom。
+    // 口径不变 —— 仍只允许平台种子模块(未知 id 立即失败)。
+    const seeds = { react, 'react-dom': { createPortal: children => children, createRoot: () => ({ render() {} }) } }
+    return factory(id => { assert.ok(id in seeds, '分块只取平台种子模块: ' + id); return seeds[id] })
+  })()
   assert.deepEqual(JSON.parse(JSON.stringify(client.parseStatistics(stats))), stats)
   assert.deepEqual(JSON.parse(JSON.stringify(client.parseDetail(detail))), detail)
   assert.throws(() => client.parseStatistics({ ...stats, totals: { ...stats.totals, cost: NaN } }))

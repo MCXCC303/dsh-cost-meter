@@ -1,15 +1,34 @@
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import vm from 'node:vm'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 import { DEFAULT_PROVIDER_PRICE_TABLE, normalizePrice, providerPriceEntryFor, buildPriceCatalog, tierFor, costOf, upgradeProviderPriceDefaults } from '../lib/pricing.js'
 import { VERIFIED_PROVIDER_PRICES } from '../lib/provider-prices.js'
 import { billingClassOf, enabledPlanSetOf, planProviderIdOf } from '../lib/plan-billing.js'
-import { defaultConfig, sanitizeConfig, applyConfigPatch, Ledger } from '../lib/store.js'
+import { defaultConfig, sanitizeConfig, applyConfigPatch, Ledger, zeroDay } from '../lib/store.js'
 import { stateSchema } from '../lib/typert.host.js'
+
+/**
+ * 现场打包客户端模块并取回导出。
+ *
+ * 旧 `src/client/*.js` 拼接片段已删,测试不再拼接源码;这里把与 `lib/` 产物同源的
+ * `src/client/*.ts` 打成临时 CJS(平台种子保持 external,由调用方注入桩)后 require,
+ * 取同一实现。NodeNext 的 `.js` 后缀导入也只有打包器能解析。
+ */
+async function clientExports(entry, seeds = {}) {
+  const result = await build({
+    stdin: { contents: entry, resolveDir: fileURLToPath(new URL('../src/client/', import.meta.url)), loader: 'js' },
+    bundle: true, write: false, platform: 'node', format: 'cjs', logLevel: 'silent',
+    external: ['react', 'react-dom', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives'],
+  })
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', result.outputFiles[0].text)(
+    id => { if (id in seeds) return seeds[id]; throw new Error('missing seed module: ' + id) }, module, module.exports)
+  return module.exports
+}
 
 const config = defaultConfig()
 assert.equal(planProviderIdOf('zen'), 'go', 'legacy host routing kept')
@@ -118,20 +137,16 @@ try {
 } finally { rmSync(path, { recursive: true, force: true }) }
 
 // Exercise emitted browser codecs and token arithmetic, including the separate UTC calendar.
-const dir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(dir).filter(n => n.endsWith('.js')).sort().map(n => readFileSync(new URL(n, dir), 'utf8')).join('')
-let factory
-vm.runInNewContext(source.replace('exports.apply = apply', 'exports.coverage = { resolveClientPrice, normalizeClientPrice, tierFor, costOfBuckets, parseConfig }; exports.apply = apply'), {
-  window: { __ModuleLoader__: { load: value => { factory = value.factory } }, localStorage: { getItem: () => null } }, navigator: { language: 'en' },
-})
-const client = factory(() => ({})).coverage
+const client = await clientExports(`export { resolveClientPrice, normalizeClientPrice, tierFor, costOfBuckets, parseState } from './logic.js'`)
+// logic.ts 未导出 parseConfig(它是 parseState 的内部实现):经 parseState 走同一函数。
+const parseClientConfig = source => client.parseState({ today: zeroDay('2026-10-03'), month: zeroDay('2026-10-03'), total: zeroDay('2026-10-03'), config: source }, 'state').config
 for (const [provider, id] of expected) {
   const back = providerPriceEntryFor(provider, id, config.prices)
   const front = client.resolveClientPrice(provider, id, config)
   assert.equal(front.priced, back.priced)
   near(client.costOfBuckets({ input: 1000, cacheRead: 2000, cacheWrite: 3000, output: 4000 }, client.tierFor(client.normalizeClientPrice(front.entry), now, { enabled: false })), costOf({ input: 1000, cacheRead: 2000, cacheWrite: 3000, output: 4000 }, back.entry, now))
 }
-const parsedConfig = client.parseConfig(JSON.parse(JSON.stringify(config)), 'config')
+const parsedConfig = parseClientConfig(JSON.parse(JSON.stringify(config)))
 const frontGo = client.resolveClientPrice('opencode-go', 'deepseek-v4-pro', { ...parsedConfig, prices: { ...parsedConfig.prices, currency: 'CNY' } })
 assert.equal(frontGo.currency, 'USD')
 assert.equal(frontGo.billingMode, 'utc-peak')

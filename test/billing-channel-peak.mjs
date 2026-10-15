@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { apply, runStartupImports, __testProjection } from '../lib/index.js'
 import { Ledger, sanitizeConfig, applyConfigPatch, localDayKey } from '../lib/store.js'
 import { qwenTokenPlanWindows, QWEN_TOKEN_PLAN_PROVIDER_IDS } from '../lib/coding-plans.js'
@@ -11,6 +12,46 @@ import { billingClassOf, planProviderIdOf, enabledPlanSetOf } from '../lib/plan-
 import { AUGUST_PRICE_TABLE as DEFAULT_PRICE_TABLE, AUGUST_PRICE_TABLE_CNY as DEFAULT_PRICE_TABLE_CNY, DEFAULT_PRICE_TABLE as CURRENT_PRICE_TABLE, costOf, providerPriceEntryFor, repairDefaultPeakPrice } from '../lib/pricing.js'
 import { recomputeLedgerPricingBasis } from '../lib/backfill.js'
 
+/**
+ * 现场打包客户端计价镜像:旧片段已删、源码已是 ES 模块;产物不导出这些内部符号,
+ * 故直接 import 真实模块源码(parseConfig 未 export,打包时追加一条等价 export 语句,
+ * 实现零改动)。React 只为满足模块顶层解构,组件不在本文件渲染。
+ */
+async function loadClientModules(modules, exposePrivate = {}) {
+  const work = mkdtempSync(join(tmpdir(), 'cm-billing-peak-'))
+  try {
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const React = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), Fragment: "Fragment",'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useSyncExternalStore: (_sub, get) => get() }\nmodule.exports = React\nmodule.exports.default = React\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const entry = join(work, 'entry.ts')
+    writeFileSync(entry, modules.map(name => `export * from ${JSON.stringify(fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url)))}\n`).join(''))
+    const outfile = join(work, 'bundle.cjs')
+    await esbuild({
+      entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+      plugins: [{
+        name: 'expose-private',
+        setup(build) {
+          for (const [moduleName, names] of Object.entries(exposePrivate)) {
+            build.onLoad({ filter: new RegExp(`${moduleName}\\.ts$`) }, args => {
+              const source = readFileSync(args.path, 'utf8')
+              const missing = names.filter(name => !new RegExp(`export (?:function|const|let|class) ${name}\\b`).test(source))
+              return { contents: missing.length > 0 ? source + `\nexport { ${missing.join(', ')} }\n` : source, loader: 'ts' }
+            })
+          }
+        },
+      }],
+    })
+    const mod = await import(pathToFileURL(outfile).href)
+    return mod.default ?? mod
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
+
 const now = Date.parse('2026-09-08T07:30:00Z') // 北京时间周二 15:30，峰窗内。
 const dayKey = localDayKey(now)
 const tokens = { input: 77_600, cacheRead: 3_500_000, output: 69_800, cacheWrite: 0 }
@@ -18,14 +59,10 @@ const baseOf = ({ cacheHit, cacheMiss, output }) => ({ cacheHit, cacheMiss, outp
 const near = (actual, expected, label) => assert.ok(Math.abs(actual - expected) < 1e-9, `${label}: ${actual} != ${expected}`)
 
 // 执行实际客户端分类和档位函数，核对前后端语义。
-const dir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(dir).filter(name => name.endsWith('.js')).sort().map(name => readFileSync(new URL(name, dir), 'utf8')).join('')
-let factory
-vm.runInNewContext(source.replace('exports.apply = apply', 'exports.test = { billingClassOfLocal, planProviderIdOfLocal, tierFor, costOfBuckets, resolveClientPrice, parseConfig }; exports.apply = apply'), {
-  window: { __ModuleLoader__: { load: value => { factory = value.factory } }, localStorage: { getItem: () => null } },
-  navigator: { language: 'en' },
-})
-const ui = factory(name => name === 'react' ? {} : {}).test
+const ui = await loadClientModules(['logic'], { logic: ['parseConfig'] })
+for (const name of ['billingClassOfLocal', 'planProviderIdOfLocal', 'tierFor', 'costOfBuckets', 'resolveClientPrice', 'parseConfig']) {
+  assert.equal(typeof ui[name], 'function', '客户端计价镜像可取: ' + name)
+}
 const config = sanitizeConfig({ codingPlans: { qwen: { enabled: true, rates: { 'qwen3.8-flash': { input: 1, cachedInput: 1, output: 1 } } } } })
 assert.deepEqual(sanitizeConfig({ prices: { default: { output: 7 } } }).prices.default, { ...baseOf(CURRENT_PRICE_TABLE.default), output: 7 }, '存量局部自定义默认价补齐基础字段，不额外继承新版峰谷档位')
 for (const provider of [...QWEN_TOKEN_PLAN_PROVIDER_IDS, ' LLM-QIANWEN-TOKENPLAN ']) {

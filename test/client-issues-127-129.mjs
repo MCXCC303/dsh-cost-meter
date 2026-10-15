@@ -1,22 +1,75 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { readFileSync, readdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, copyFileSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { sanitizeConfig } from '../lib/store.js'
 import { DEFAULT_PROVIDER_PRICE_TABLE, normalizePrice, costOf } from '../lib/pricing.js'
 
-const sourceDir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(sourceDir).filter(name => name.endsWith('.js')).sort().map(name => readFileSync(new URL(name, sourceDir), 'utf8')).join('')
-const expose = ['mergeSessionUsage', 'useSessionUsage', 'SessionCost', 'DockLine', 'fetchCodexQuota', 'useCodexQuota', 'codexQuotaCache', 'CodexPlanBox', 'SidebarFooter', 'GatewayQuotaBox', 'parsePrice', 'normalizeClientPrice', 'tierFor', 'costOfBuckets']
+/**
+ * 构建客户端 bundle 一次;每个 environment() 复制成独立文件再 import,复刻旧 vm
+ * 沙箱「每个环境独立模块状态」的语义(codexQuotaCache 等模块级缓存互不串味)。
+ * 源码已是 ES 模块(旧片段已删),fetchCodexQuota 未 export,打包时追加等价 export。
+ */
+const CLIENT_ENV_BANNER = 'const __cmEnv = globalThis.__cmEnv ?? {}\n'
+  + 'const Date = __cmEnv.Date ?? globalThis.Date\n'
+  + 'const window = __cmEnv.window\n'
+  + 'const document = __cmEnv.document\n'
+  + 'const navigator = __cmEnv.navigator ?? globalThis.navigator\n'
+  + 'const fetch = __cmEnv.fetch\n'
+  + 'const setTimeout = __cmEnv.setTimeout\n'
+  + 'const clearTimeout = __cmEnv.clearTimeout\n'
+  + 'const setInterval = __cmEnv.setInterval\n'
+  + 'const clearInterval = __cmEnv.clearInterval\n'
+  + 'const AbortSignal = __cmEnv.AbortSignal ?? globalThis.AbortSignal\n'
+let clientBundlePath = null
+let clientInstanceSeq = 0
+async function instantiateClient() {
+  if (clientBundlePath === null) {
+    const work = mkdtempSync(join(tmpdir(), 'cm-client-issues-'))
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const base = { Fragment: "fragment", createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useSyncExternalStore: (_sub, get) => get() }\n'
+      + 'const R = Object.assign({}, base, globalThis.__cmReactStub ?? {})\nmodule.exports = R\nmodule.exports.default = R\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const entry = join(work, 'entry.ts')
+    writeFileSync(entry, ['logic', 'ui-badge', 'ui-quota', 'ui-sidebar', 'ui-balance']
+      .map(name => `export * from ${JSON.stringify(fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url)))}\n`).join(''))
+    const outfile = join(work, 'bundle.cjs')
+    await esbuild({
+      entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      banner: { js: CLIENT_ENV_BANNER },
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+      plugins: [{
+        name: 'expose-private',
+        setup(build) {
+          build.onLoad({ filter: /ui-quota\.ts$/ }, args => {
+            const source = readFileSync(args.path, 'utf8')
+            const missing = ['fetchCodexQuota'].filter(name => !new RegExp(`export (?:function|const|let|class) ${name}\\b`).test(source))
+            return { contents: missing.length > 0 ? source + `\nexport { ${missing.join(', ')} }\n` : source, loader: 'ts' }
+          })
+        },
+      }],
+    })
+    clientBundlePath = outfile
+  }
+  const copy = clientBundlePath.replace(/\.cjs$/, `-${++clientInstanceSeq}.cjs`)
+  copyFileSync(clientBundlePath, copy)
+  const mod = await import(pathToFileURL(copy).href)
+  return mod.default ?? mod
+}
+
 const element = (type, props, ...children) => ({ type, props: props ?? {}, children })
-expose.push('TurnCost')
-expose.push('QuotaStrip')
 const nodes = value => Array.isArray(value) ? value.flatMap(nodes) : value && typeof value === 'object' ? [value, ...nodes(value.children)] : []
 const textOf = value => Array.isArray(value) ? value.map(textOf).join(' ') : value && typeof value === 'object' ? textOf(value.children) : typeof value === 'string' || typeof value === 'number' ? String(value) : ''
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 
 // 每个实例拥有自己的 hook 槽位;effect 依赖变化先 cleanup,异步 setState 支持函数更新。
-function environment(fetchImpl = async () => ({ ok: false })) {
-  let factory, current, nextTimer = 0
+async function environment(fetchImpl = async () => ({ ok: false })) {
+  let current, nextTimer = 0
   const storage = new Map(), timers = new Map(), requests = []
   const schedule = (fn, delay, repeat) => { const id = ++nextTimer; timers.set(id, { fn, delay, repeat }); return id }
   const React = {
@@ -43,14 +96,20 @@ function environment(fetchImpl = async () => ({ ok: false })) {
       }
     },
   }
-  vm.runInNewContext(source.replace('exports.apply = apply', `exports.test = { ${expose.join(', ')} }; exports.apply = apply`), {
-    navigator: { language: 'en' }, console, AbortSignal,
-    window: { __ModuleLoader__: { load: value => { factory = value.factory } }, localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)) } },
+  // 旧 vm 沙箱的等价物:客户端模块读到的 React / window / fetch / 计时器由本环境提供
+  // (banner 在实例化时绑定到模块作用域),互不串味、也不污染宿主与其它测试。
+  globalThis.__cmReactStub = React
+  globalThis.__cmEnv = {
+    window: { localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)) } },
+    navigator: { language: 'en' }, AbortSignal,
     fetch: (...args) => { requests.push(args); return fetchImpl(...args) },
     setTimeout: (fn, delay) => schedule(fn, delay, false), clearTimeout: id => timers.delete(id),
     setInterval: (fn, delay) => schedule(fn, delay, true), clearInterval: id => timers.delete(id),
-  })
-  const ui = factory(name => name === 'react' ? React : { Tooltip: 'tooltip' }).test
+  }
+  const ui = await instantiateClient()
+  for (const name of ['mergeSessionUsage', 'useSessionUsage', 'SessionCost', 'DockLine', 'fetchCodexQuota', 'useCodexQuota', 'codexQuotaCache', 'CodexPlanBox', 'SidebarFooter', 'GatewayQuotaBox', 'parsePrice', 'normalizeClientPrice', 'tierFor', 'costOfBuckets', 'TurnCost', 'QuotaStrip']) {
+    assert.ok(ui[name] !== undefined, '客户端符号可取: ' + name)
+  }
   const instances = []
   const mount = (render, props = {}) => {
     const owner = { hooks: [], cursor: 0, effects: [], dirty: false, disposed: false, props, tree: null }
@@ -91,7 +150,7 @@ const config = sanitizeConfig({ locale: 'en', currency: 'USD', symbol: '$', exch
   sidebar: false, hideTodayCost: true, hideOfficialBalance: true, goQuota: { enabled: false }, budget: { enabled: false } })
 const usage = (input, cost, apiCost) => ({ input, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, cost, ...(apiCost === undefined ? {} : { apiCost }) })
 const snapshot = (own, subagents = usage(0, 0, 0), found = true) => ({ own, subagents, found, subagentCount: subagents.input > 0 ? 1 : 0 })
-const e = environment()
+const e = await environment()
 // #205: show exact bucket arithmetic, keep Plan separate and reject stale replies.
 {
   const requests = []
@@ -249,7 +308,7 @@ for (const locale of ['en', 'zh']) {
 
 // Codex 插件查询是显式选择:关闭状态不探测,开启才查询同源路由,关闭解除订阅。
 const quotaRequest = deferred()
-const quota = environment(() => quotaRequest.promise)
+const quota = await environment(() => quotaRequest.promise)
 const disabled = quota.mount(p => quota.ui.useCodexQuota(p.enabled), { enabled: false })
 await quota.flush()
 assert.equal(quota.requests.length, 0)
@@ -296,7 +355,7 @@ await quota.tick(60000); await quota.tick(300000)
 assert.equal(quota.requests.length, 1, '关闭后不重试、不轮询')
 quota.dispose()
 
-const missing = environment(async () => ({ ok: false, status: 404 }))
+const missing = await environment(async () => ({ ok: false, status: 404 }))
 const missingHook = missing.mount(p => missing.ui.useCodexQuota(p.enabled), { enabled: true })
 await missing.flush()
 assert.equal(missingHook.tree.status, 'unavailable')
@@ -306,7 +365,7 @@ assert.equal(missing.requests.length, 1, '插件未安装且已关闭时不反�
 missing.dispose()
 
 // 账号标识与来源隔离;相同label不当作同一账号,列表重排保持选择。
-const gateway = environment()
+const gateway = await environment()
 const account = (id, percent, empty = false) => ({ id, label: 'Shared label', provider: 'codex', windows: empty ? [] : [{ id: 'weekly', label: 'window-' + id, percent }], credits: null })
 const a = account('a', 10), b = account('b', 20), blank = account('blank', 0, true)
 let sourceDef = { id: 'source-a', label: 'Gateway A' }, accounts = [a, b, blank], refreshes = 0

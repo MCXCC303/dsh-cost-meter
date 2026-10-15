@@ -12,6 +12,8 @@ import './peak-dynamic-style.mjs'
 import { readFileSync, rmSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join, dirname, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { tmpdir as osTmpdir } from 'node:os'
 import * as zlib from 'node:zlib'
 import {
@@ -123,10 +125,68 @@ process.on('exit', () => {
 // 此视图,保证测试看到的与构建产物同源。
 function readClientSource() {
   const dir = new URL('../src/client/', import.meta.url)
-  const parts = readdirSync(dir).filter(name => name.endsWith('.js')).sort()
-  assert.ok(parts.length > 0, 'src/client/ 源码片段缺失')
-  return parts.map(name => readFileSync(new URL(name, dir), 'utf8')).join('')
+  const parts = readdirSync(dir).filter(name => name.endsWith('.ts')).sort()
+  assert.ok(parts.length > 0, 'src/client/ 源码模块缺失')
+  return parts.map(name => readFileSync(new URL(name, dir), 'utf8')).join('\n')
 }
+
+/**
+ * 归一化引号:把产物里的 `"…"` 简单字符串字面量改写成 `'…'`。
+ *
+ * 宿主产物由 tsdown 生成,它输出双引号;而本套件有三十多处断言是按源码原文
+ * (单引号)写的。只改写不含引号/换行/反斜杠的简单字面量,既能命中,又不会
+ * 破坏产物本身的语义 —— 断言只做文本包含判断,不执行产物。
+ */
+function normalizeQuotes(text) {
+  return text.replace(/"([^"'\\\n]*)"/g, "'$1'")
+}
+
+/**
+ * 读取 tsdown 生成的宿主产物文本(index.js / backfill.js / typert.host.js / coding-plans.js):
+ * 产物统一输出双引号、`void 0`、单参箭头加括号,且会重排/内联源码,而本套件断言按
+ * 源码原文写;故读回来先做这三类**等价形态**归一 —— 只改写代码写法,不改变断言语义。
+ */
+function readHostModule(name) {
+  return normalizeQuotes(readFileSync(new URL(`../lib/${name}`, import.meta.url), 'utf8'))
+    .replace(/\bvoid 0\b/g, 'undefined')
+    .replace(/\((\w+)\) =>/g, '$1 =>')
+}
+
+/**
+ * 载入一个客户端模块(现场打包为临时 CJS 再 import)。
+ *
+ * 客户端已迁真 ES 模块(export/类型标注/跨模块 import),旧的「拼接片段 + 切片 +
+ * new Function 求值」对 `export` 关键字与跨模块常量必然失败;而构建产物只导出
+ * 启动/分块入口,不导出 priceEntryFor/tierFor/formatTzOffset 等内部符号。
+ * 故与 test/pricing-model-matching.mjs 同法:用 esbuild(devDependency)把
+ * `src/client/<name>.ts` 打成临时 CJS —— 与被测产物同一份源码、同一套实现。
+ */
+async function loadClientModule(name) {
+  const work = mkdtempSync(join(osTmpdir(), `cm-verify-${name}-`))
+  try {
+    // 平台种子模块的打包期替身:本套件只求纯函数,不渲染组件树。
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const React = { createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }), Fragment: "Fragment",'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useContext: () => undefined, createContext: () => ({ Provider: null, Consumer: null }),'
+      + ' forwardRef: fn => fn, memo: fn => fn }\nmodule.exports = React\nmodule.exports.default = React\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const outfile = join(work, `${name}.cjs`)
+    await esbuild({
+      entryPoints: [fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url))],
+      bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+    })
+    const mod = await import(pathToFileURL(outfile).href)
+    return mod.default ?? mod
+  } finally {
+    rmSync(work, { recursive: true, force: true })
+  }
+}
+/** 客户端计价/格式化镜像(logic.ts)与余额侧助手(ui-balance.ts):源码即真源。 */
+const clientLogic = await loadClientModule('logic')
+const clientBalance = await loadClientModule('ui-balance')
 
 // 浏览器端 bundle 语法门禁(v1.5.23 教训):client.js 只在浏览器经 <script> 执行,
 // classic script 语法错误不触发 error 事件、宿主只报「loaded without registering」,
@@ -331,18 +391,19 @@ console.log('[ok] usdFromCost(CNY 折算/USD 原值/非法兜底/往返抵消)�
 // 1e) 源码接线断言(issue #47):fetchPrices 按币种选官方页/失败回退另一语言页/
 // 价表币种标记/default 替换;设置页币种下拉与读侧白名单;backfill 回放同口径。
 {
-  const indexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
-  assert.ok(indexSource.includes("const url = pricingCurrency === 'CNY' ? OFFICIAL_PRICING_URL_ZH : OFFICIAL_PRICING_URL"), 'fetchPricingHtml 按币种选官方页')
+  const indexSource = readHostModule('index.js')
+  assert.ok(/pricingCurrency === 'CNY' \? OFFICIAL_PRICING_URL_ZH : OFFICIAL_PRICING_URL/.test(indexSource), 'fetchPricingHtml 按币种选官方页(常量可被内联,只看三元选择本身)')
   assert.ok(indexSource.includes("parsePricingHtml(await fetchPricingHtml(locale, wanted === 'CNY' ? 'USD' : 'CNY'))"), '目标币种页失败回退另一语言页')
   assert.ok(indexSource.includes("currency: parsed.currency === 'CNY' ? 'CNY' : 'USD'"), '同步写入价表币种标记')
-  assert.ok(indexSource.includes('...(def === null ? {} : { default: def })'), 'default 随页面替换(不残留旧币种数字)')
+  // rolldown 会把 `...(a ? b : c)` 打印成 `...a ? b : c`(语义等价,只少一层包裹括号),故两种形态都接受。
+  assert.ok(/\.\.\.\(?def === null \? \{\} : \{ default: def \}/.test(indexSource), 'default 随页面替换(不残留旧币种数字)')
   assert.ok(indexSource.includes('pricesSyncedFallback'), '回退提示文案存在(zh/en)')
   const clientSource = readClientSource()
   assert.ok(clientSource.includes("setField('pricingCurrency'"), '设置页含官方价格币种下拉')
   assert.ok(clientSource.includes("pricingCurrency: v.pricingCurrency === 'CNY' ? 'CNY' : 'USD'"), 'parseConfig 白名单含 pricingCurrency(读侧不剥离)')
-  const backfillSource = readFileSync(new URL('../lib/backfill.js', import.meta.url), 'utf8')
+  const backfillSource = readHostModule('backfill.js')
   assert.ok(backfillSource.includes('usdFromCost(priced,'), '历史回填与实时计费同口径折算')
-  const hostTypert = readFileSync(new URL('../lib/typert.host.js', import.meta.url), 'utf8')
+  const hostTypert = readHostModule('typert.host.js')
   assert.ok(hostTypert.includes("pricingCurrency: z.enum(['USD', 'CNY']).optional()"), 'typert 声明 pricingCurrency(网关不剥离)')
   console.log('[ok] 人民币计价接线(选页/回退/币种标记/default 替换/下拉/白名单/回放同口径)通过')
 }
@@ -1222,7 +1283,7 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.equal(conv.peakAlertAhead, 2, '越界提前量收敛回 2')
   assert.equal(conv.peakAlertTarget, 'both', '非法类型收敛 both')
   // 双端声明与客户端接线:typert config schema、PeakAlert 组件、浮层注册、类型过滤逻辑、设置 UI。
-  const hostTypert = readFileSync(new URL('../lib/typert.host.js', import.meta.url), 'utf8')
+  const hostTypert = readHostModule('typert.host.js')
   assert.ok(hostTypert.includes('peakAlertEnabled') && hostTypert.includes("z.enum(['peak', 'offpeak', 'both'])"), 'typert config 声明提醒字段')
   const clientSource = readClientSource()
   assert.ok(clientSource.includes('function PeakAlert('), '客户端 PeakAlert 组件存在')
@@ -1256,9 +1317,10 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.ok(clientSource.includes('peakAlertBadgePeak') && clientSource.includes('peakAlertBadgeOffPeak'), '徽标文案存在')
   // 1.5.20 真实预览通道 + 1.5.21 修复:API 挪到 activate 顶层、组件挂常驻插槽。
   assert.ok(clientSource.includes("const PEAK_ALERT_PREVIEW_EVENT = 'cm-peak-alert-preview'"), '预览事件常量存在')
-  assert.ok(clientSource.includes('window.cmPeakAlertPreview = kind =>'), 'window.cmPeakAlertPreview API 注册')
+  // TS 源码带类型标注:`(window as any).cmPeakAlertPreview = (kind: string) => {`。
+  assert.ok(/cmPeakAlertPreview = \(kind: string\) =>/.test(clientSource), 'window.cmPeakAlertPreview API 注册')
   assert.ok(clientSource.includes('window.addEventListener(PEAK_ALERT_PREVIEW_EVENT, onPreview)'), '组件监听预览事件')
-  assert.ok(clientSource.includes('window.__cmPeakAlertLive = true'), '组件在线标志存在')
+  assert.ok(clientSource.includes('__cmPeakAlertLive = true'), '组件在线标志存在')
   assert.ok(clientSource.includes("window.cmPeakAlertPreview?.('peak')") && clientSource.includes("window.cmPeakAlertPreview?.('offpeak')"), '设置页预览按钮接线')
   assert.ok(clientSource.includes('peakAlertPreviewLabel') && clientSource.includes('peakAlertPreviewPeak') && clientSource.includes('peakAlertPreviewOffPeak'), '预览按钮文案(zh/en)存在')
   assert.ok(clientSource.includes('peakAlertPreviewTag'), '预览通知标题标记文案存在')
@@ -1289,7 +1351,7 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.ok(applyConfigPatch(base, { hideTodayCost: 'yes' }).errors.length > 0, '非布尔 hideTodayCost 被拒')
   assert.equal(sanitizeConfig({ ...base, hideOfficialBalance: 'x' }).hideOfficialBalance, false, '非法 hideOfficialBalance 清洗为关')
   assert.equal(sanitizeConfig({ ...base, hideTodayCost: 'x' }).hideTodayCost, false, '非法 hideTodayCost 清洗为关')
-  const hostTypert = readFileSync(new URL('../lib/typert.host.js', import.meta.url), 'utf8')
+  const hostTypert = readHostModule('typert.host.js')
   assert.ok(hostTypert.includes('hideOfficialBalance: z.boolean().optional()'), 'typert config 声明 hideOfficialBalance(网关不剥离)')
   assert.ok(hostTypert.includes('hideTodayCost: z.boolean().optional()'), 'typert config 声明 hideTodayCost(网关不剥离)')
   const clientSource = readClientSource()
@@ -1300,7 +1362,8 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.ok(clientSource.includes('&& state?.config?.hideTodayCost !== true'), 'footer 注册同口径门控今日消耗')
   // 概览卡片 / BalancePanel / 预算明细今日行。
   assert.ok(clientSource.includes('config.hideTodayCost === true ? null : el(Card,'), '概览今日卡片可整体隐藏')
-  assert.ok(clientSource.includes("&& config.hideOfficialBalance !== true\n          ? el(BalancePanel"), '设置页官方余额面板可整体隐藏')
+  // TS 源码多行缩进为 6 空格(旧片段为 10),只断言同一门控表达式。
+  assert.ok(/&& config\.hideOfficialBalance !== true\s*\? el\(BalancePanel/.test(clientSource), '设置页官方余额面板可整体隐藏')
   assert.ok(clientSource.includes('config.hideTodayCost === true ? null : el(\'div\', { className: \'cm-bbox-line cm-num\' }'), '预算盒明细今日金额行可隐藏')
   assert.ok(clientSource.includes("...(config.hideTodayCost === true ? [] : [config.sidebarTodayMetric === 'tokens'"), '预算 tooltip 今日金额行可隐藏')
   // 设置开关与读侧白名单。
@@ -1313,8 +1376,10 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.ok(clientSource.includes('showSessionId: v.showSessionId === true'), 'parseConfig 白名单补齐 showSessionId(既有缺陷修复)')
   // v1.5.38 的隐私模式遮罩已整体移除。
   assert.ok(!clientSource.includes('hideAmounts'), '客户端不再含 hideAmounts 隐私遮罩')
-  const indexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
-  assert.ok(!indexSource.includes('hideAmounts'), '服务端不再含 hideAmounts 遮罩')
+  const indexSource = readHostModule('index.js')
+  // 服务端已无遮罩行为;tsdown 只保留清洗旧账本残留的那一处 `delete out.hideAmounts`。
+  assert.equal((indexSource.match(/hideAmounts/g) ?? []).length, 1, '服务端不再含 hideAmounts 遮罩(仅剩旧键清洗)')
+  assert.ok(/delete out\.hideAmounts/.test(indexSource), '服务端清洗旧账本 hideAmounts 残留')
   console.log('[ok] UI 隐藏开关(默认值/校验/清洗/typert/渲染门控/设置开关/白名单/遮罩移除)通过')
 }
 
@@ -1337,7 +1402,7 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.equal(conv.quotaStrip.plans, true, '非法 plans 清洗为开')
   assert.equal(conv.quotaStrip.promptSeen, false, '非法 promptSeen 清洗为未引导')
   // 双端声明与接线。
-  const hostTypert = readFileSync(new URL('../lib/typert.host.js', import.meta.url), 'utf8')
+  const hostTypert = readHostModule('typert.host.js')
   const clientSource = readClientSource()
   assert.ok(hostTypert.includes('quotaStrip: z.object({') && hostTypert.includes('promptSeen: z.boolean()'), 'typert 声明 quotaStrip 五布尔字段')
   assert.ok(clientSource.includes("enabled: v.quotaStrip?.enabled === true"), 'parseConfig 归一 quotaStrip')
@@ -1351,14 +1416,19 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   assert.ok(clientSource.includes('quotaStripGuideTitle') && clientSource.includes('quotaStripGuideOn') && clientSource.includes('quotaStripGuideOff'), '引导卡文案存在')
   assert.ok(clientSource.includes('quotaStripGuideBody'), '引导卡正文文案存在')
   assert.ok(clientSource.includes('promptSeen: true } })'), '设置开关与引导选择均写 promptSeen')
-  assert.ok(clientSource.includes("const STRIP_VENDOR_SHORT = {"), '厂商短标签映射存在')
+  // TS 源码带类型标注:`export const STRIP_VENDOR_SHORT: Record<string, string> = {`。
+  assert.ok(/const STRIP_VENDOR_SHORT(: [^=]+)? = \{/.test(clientSource), '厂商短标签映射存在')
   assert.ok(clientSource.includes('commandcode: \'CC\'') && clientSource.includes('scnet: \'SCNet\''), '短标签覆盖八家厂商')
   // 点击刷新 + 厂商多窗口融合(issue #52)。
   assert.ok(clientSource.includes('.cm-qchip .cm-qbar{display:block;') && clientSource.includes('.cm-qchip .cm-qfill{display:block;'), '进度条填充 display:block(行内盒宽高被忽略的根因修复)')
   assert.ok(clientSource.includes('.cm-qchip.action{cursor:pointer') && clientSource.includes('.cm-qchip.action:focus-visible') && clientSource.includes('.cm-qchip.action:active'), '可点击 chip 手型/焦点环/按压态样式')
-  assert.ok(clientSource.includes('const [busyKey, setBusyKey] = useState(null)'), 'busyKey useState 存在')
-  const qstripBody = clientSource.slice(clientSource.indexOf('function QuotaStrip('), clientSource.indexOf('function QuotaStripGuide('))
-  assert.ok(qstripBody.indexOf('const [busyKey, setBusyKey] = useState(null)') < qstripBody.indexOf('if (!state) return null'), 'Hook 先于条件返回(React 规则)')
+  // TS 源码把 null 收窄成 string | null(`useState(null as string | null)`),只断言同一 Hook 形态。
+  assert.ok(/const \[busyKey, setBusyKey\] = useState\(null(?: as [^)]+)?\)/.test(clientSource), 'busyKey useState 存在')
+  // QuotaStrip 与 QuotaStripGuide 现分居 ui-quota.ts / guides.ts(模块按文件名排序,顺序与旧片段相反),
+  // 故按函数定义取 QuotaStrip 自身函数体(到行首闭合花括号),不再依赖两者的先后位置。
+  const qstripStart = clientSource.indexOf('export function QuotaStrip')
+  const qstripBody = clientSource.slice(qstripStart, clientSource.indexOf('\n}', qstripStart))
+  assert.ok(qstripBody.indexOf('const [busyKey, setBusyKey] = useState(') < qstripBody.indexOf('if (!state) return null'), 'Hook 先于条件返回(React 规则)')
   assert.ok(clientSource.includes("key === 'budget' ? api.reload()") && clientSource.includes("key === 'go' ? api.refreshGoQuota()") && clientSource.includes("api.refreshCodingPlan(key)"), '点击按 key 多路分发刷新')
   assert.ok(clientSource.includes("key === 'codex' ? fetchCodexQuota(true, config.codexQuotaEnabled === true)"), 'Codex chip 点击仅在开启后重探')
   assert.ok(clientSource.includes('clickableRefreshProps(busy, () => doRefresh(c.key))'), 'chip 复用可点击属性 helper(role/tabIndex/aria-busy/键盘)')
@@ -1380,23 +1450,27 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   const conv = sanitizeConfig({ ...base, balance: { ...base.balance, clickHintSeen: 1 } })
   assert.equal(conv.balance.clickHintSeen, false, '非法 clickHintSeen 清洗为未引导')
   // 双端声明与客户端归一。
-  const hostTypert = readFileSync(new URL('../lib/typert.host.js', import.meta.url), 'utf8')
+  const hostTypert = readHostModule('typert.host.js')
   const clientSource = readClientSource()
   assert.ok(hostTypert.includes('clickHintSeen: z.boolean().optional()'), 'typert 声明 balance.clickHintSeen')
   assert.ok(clientSource.includes('clickHintSeen: v.balance?.clickHintSeen === true'), 'parseConfig 归一 clickHintSeen')
   // 共享 helper:busy 防连点 + 失败信息留存(下次刷新清除)。
   assert.ok(clientSource.includes('function useClickRefresh('), 'useClickRefresh helper 存在')
   assert.ok(clientSource.includes("if (busy || typeof call !== 'function') return"), 'busy 期间忽略连点(防并发打接口)')
-  assert.ok(clientSource.includes('catch(error => { setErr(error?.message ?? String(error)) })'), '失败原因留存供 tooltip')
+  // TS 源码给 catch 变量标注了 any(`.catch((error: any) => { setErr(…) })`)。
+  assert.ok(/catch\(\(error: any\) => \{ setErr\(error\?\.message \?\? String\(error\)\) \}\)/.test(clientSource), '失败原因留存供 tooltip')
   // 六类图框接线:官方余额(框+行)、自定义余额(框+行)、Coding Plan(通用+MiniMax)。
   assert.equal((clientSource.match(/useClickRefresh\(api \? \(\) => api\.refreshBalance\(\) : null\)/g) ?? []).length, 2, '官方余额框/行均接 refreshBalance')
   assert.equal((clientSource.match(/useClickRefresh\(api \? \(\) => api\.refreshCustomBalance\(index\) : null\)/g) ?? []).length, 2, '自定义余额框/行均接 refreshCustomBalance(多配置形态按条目 index 刷新,issue #79)')
   assert.ok(clientSource.includes("useClickRefresh(api ? () => api.refreshCodingPlan(id) : null)"), '通用 Coding Plan 图框接 refreshCodingPlan(id)')
   assert.ok(clientSource.includes("useClickRefresh(api ? () => api.refreshCodingPlan('minimax') : null)"), 'MiniMax 图框接 refreshCodingPlan(minimax)')
-  const footerSource = clientSource.match(/function SidebarFooter\(props\) \{([\s\S]*?)\n    \}/)?.[0] ?? ''
+  // TS 源码缩进为 2 空格且带类型标注,函数体按行首闭合花括号截取(不再匹配固定缩进)。
+  const footerStart = clientSource.indexOf('function SidebarFooter')
+  const footerSource = clientSource.slice(footerStart, clientSource.indexOf('\n}', footerStart))
   assert.equal((footerSource.match(/api: props\.api/g) ?? []).length, 7, 'SidebarFooter 七处渲染均透传 api(六类图框 + Codex 卡片)')
   // 可点击语义与视觉反馈:a11y(role/tabIndex/aria-busy/键盘)、CSS(cursor/hover/busy 呼吸)。
-  assert.ok(clientSource.includes('const clickableRefreshProps = (busy, run) => ({'), '可点击属性 helper 存在')
+  // TS 源码带参数类型(`(busy: any, run: any) => ({`),只断言 helper 定义与返回对象。
+  assert.ok(/const clickableRefreshProps = \(busy(: [^,)]+)?, run(: [^,)]+)?\) => \(\{/.test(clientSource), '可点击属性 helper 存在')
   assert.ok(clientSource.includes("role: 'button'") && clientSource.includes("tabIndex: 0") && clientSource.includes("'aria-busy': busy ? 'true' : 'false'"), 'role=button + tabIndex + aria-busy')
   assert.ok(clientSource.includes("event.key === 'Enter' || event.key === ' '"), '键盘 Enter/Space 同样触发')
   assert.ok(clientSource.includes('.cm-bbox.clickable,.cm-foot.clickable{cursor:pointer}'), '可点击光标样式')
@@ -1508,6 +1582,16 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
           while (i < body.length && /\s/.test(body[i])) i += 1
           continue
         }
+        // 嵌套的 function 声明/表达式(如工厂返回的组件 `return function ChunkComponent(props) {…}`、
+        // 局部 `function wrap(Original) {…}`)自成一格:其 Hook 与 return 属于该函数自身,
+        // 与箭头的处理一致,不计入外层组件上下文(fnBraces 已非空时无需再判)。
+        if (fnBraces.length === 0 && body.startsWith('function', i) && !(i > 0 && /[A-Za-z0-9_$.]/.test(body[i - 1]))) {
+          let j = i + 'function'.length
+          while (j < body.length && body[j] !== '{' && body[j] !== ';' && body[j] !== '\n') j += 1
+          if (body[j] === '{') { fnBraces.push(depth); depth += 1; i = j + 1; continue }
+          i = j
+          continue
+        }
         if (c === '{') {
           if (pendingArrow) { fnBraces.push(depth); pendingArrow = false }
           depth += 1
@@ -1551,8 +1635,10 @@ assert.deepEqual(CODING_PLAN_PROVIDERS.scnet.credentialEnvs, [], 'scnet 不需�
   const violations = scanHookOrder(hookSrc)
   assert.equal(violations.length, 0, 'Hook 顺序门禁:所有组件的 Hook 均在组件级条件 return 之前(React #300 回归):' + JSON.stringify(violations))
   // QuotaStripGuide 定点断言:useRef 必须先于首个 return null(issue #32 修复点)。
-  const guideStart = hookSrc.indexOf('function QuotaStripGuide(')
-  const guideBody = hookSrc.slice(guideStart, hookSrc.indexOf('function BudgetBoxContent(', guideStart))
+  // QuotaStripGuide 现居 guides.ts,其后不再紧跟 BudgetBoxContent(模块排序变了),
+  // 故按行首闭合花括号界定该函数体。
+  const guideStart = hookSrc.indexOf('export function QuotaStripGuide')
+  const guideBody = hookSrc.slice(guideStart, hookSrc.indexOf('\n}', guideStart))
   assert.ok(guideBody.indexOf('useRef(false)') >= 0 && guideBody.indexOf('useRef(false)') < guideBody.indexOf('if (!state) return null'), 'QuotaStripGuide 的 useRef 在条件返回之前(Hook 顺序稳定)')
   console.log('[ok] Hook 顺序门禁(组件级 return 后无 Hook 调用/门禁自检/全库扫描)通过')
 }
@@ -1613,12 +1699,23 @@ assert.equal(gtsInvocation.result.mode, 'strict', 'getTopSessions 返回 strict 
   assert.equal(byCostDesc[0].date, '2026-08-17', '排行条目携带所属日期')
 }
 // 客户端 descriptor 清单与服务端 typert 清单逐方法对齐(issue #16 回归:漏注册 refreshCodingPlan 曾致刷新按钮报 is not a function)。
-const clientSrc = readClientSource()
+// 产物不再把 CONTRIBUTION 挂在 factory 导出上(也不再是可由 vm 直接执行的拼接片段);
+// 按平台真实路径从 apply(ctx) 的 remote.$mount(CONTRIBUTION) 入参取回,与宿主挂载同源。
 let descriptorFactory
-vm.runInNewContext(clientSrc.replace('exports.apply = apply', 'exports.descriptors = CONTRIBUTION.descriptors; exports.apply = apply'), {
+vm.runInNewContext(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'), {
   window: { __ModuleLoader__: { load: value => { descriptorFactory = value.factory } } }, navigator: { language: 'en' },
 })
-const descriptors = descriptorFactory(() => ({})).descriptors
+const clientModule = descriptorFactory(name => name === 'react'
+  ? { createElement: () => null, Fragment: 'f', useState: () => [null, () => {}], useEffect: () => {}, useRef: () => ({ current: null }), useMemo: fn => fn(), useCallback: fn => fn }
+  : { Tooltip: () => null })
+let contribution
+await clientModule.apply({
+  remote: { $mount: async value => { contribution = value; return () => {} } },
+  effect: fn => fn(),
+  get: () => undefined,
+  on: () => () => {},
+})
+const descriptors = [...contribution.descriptors]
 let statisticsFactory
 vm.runInNewContext(readFileSync(new URL('../lib/client.statistics.js', import.meta.url), 'utf8'), {
   window: { __ModuleLoader__: { load: value => { statisticsFactory = value.factory } } },
@@ -1838,12 +1935,14 @@ console.log('[ok] 宽泛匹配与跨厂商兑底(路由 provider 费用为零修
 // 6.9 外部查询软/硬失败缓存策略(PR #40 补全):软失败(守卫错误,不会自愈)完整缓存;
 // 硬失败(网络超时等)写 error 状态但保留外层 fetchedAt——UI 可见失败原因且轮询自动重试。
 {
-  const retryIndexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const retryIndexSource = readHostModule('index.js')
   assert.ok(retryIndexSource.includes('err.soft = true'), 'queryBalance 守卫错误(未配置 Key/非官方端点)标记 soft')
   // 官方余额的 401 缓存与 500 自动恢复由 balance-credentials.mjs 实际调用验证。
-  assert.ok(retryIndexSource.includes("...goQuotaCache, value: { ...emptyGoQuota(), status: 'error'"), 'Go 额度硬失败写 error 状态并保留旧 fetchedAt')
+  // tsdown 把对象字面量打印成多行(每字段一行),故用空白容忍正则锁定同一表达式。
+  assert.ok(/\.\.\.goQuotaCache,\s*value:\s*\{\s*\.\.\.emptyGoQuota\(\),\s*status: 'error'/.test(retryIndexSource), 'Go 额度硬失败写 error 状态并保留旧 fetchedAt')
   // 自定义余额的失败与恢复通过 cache-lifecycle.mjs 实际调用服务验证。
-  assert.ok(retryIndexSource.includes("...(codingPlanCaches[id] ?? { fetchedAt: 0, value: emptyCodingPlan() }),\n          value: { ...emptyCodingPlan(), status: 'error'"), 'Coding Plan 硬失败写 error 状态并保留旧 fetchedAt')
+  // tsdown 多行打印 + 去掉 `...(a ?? b)` 的包裹括号,故按同一表达式做空白容忍匹配。
+  assert.ok(/\.\.\.codingPlanCaches\[id\] \?\? \{\s*fetchedAt: 0,\s*value: emptyCodingPlan\(\)\s*\},\s*value: \{\s*\.\.\.emptyCodingPlan\(\),\s*status: 'error'/.test(retryIndexSource), 'Coding Plan 硬失败写 error 状态并保留旧 fetchedAt')
   assert.ok(retryIndexSource.includes("error && error.soft === true"), '软失败判定读取 error.soft 标记')
   console.log('[ok] 外部查询软/硬失败缓存策略断言通过')
 }
@@ -1984,7 +2083,7 @@ assert.ok(CODING_PLAN_ENDPOINTS.zai.every(u => new URL(u).host.endsWith('z.ai') 
 assert.ok(CODING_PLAN_ENDPOINTS.zai[0].endsWith('bigmodel.cn/api/monitor/usage/quota/limit') && CODING_PLAN_ENDPOINTS.zai[1].endsWith('z.ai/api/monitor/usage/quota/limit'), 'Z.ai 监控端点(issue #42)两域优先')
 assert.ok(CODING_PLAN_ENDPOINTS.zai.slice(2).some(u => u.includes('/v3/')), 'Z.ai v3 旧计费端点保留兜底(issue #17)')
 {
-  const codingPlansSource = readFileSync(new URL('../lib/coding-plans.js', import.meta.url), 'utf8')
+  const codingPlansSource = readHostModule('coding-plans.js')
   assert.ok(codingPlansSource.includes("if (provider === 'zai' || provider === 'minimax' || isKimiCoding) { lastError = error; continue }"), 'Z.ai/minimax 单域 401 换域重试(双域 Key 不互通);kimi 订阅端点 401 降级 PAYG 兜底(issue #53)')
   // issue #44:全部端点失败时,解析失败(200 但结构不对)优先于最后端点的 404 报出,
   // 避免 v4 计费端点 404 盖住 monitor 端点解析失败的真实原因。
@@ -2389,7 +2488,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   assert.equal(plainEntryD3.cost, 0.5, '普通会话金额不被触碰')
   assert.ok(scheduled >= 1, '清洗后调度落盘')
   // 投影与启动接线:源码结构断言(投影无独立运行时入口,行为经宿主重放自愈)。
-  const indexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const indexSource = readHostModule('index.js')
   assert.ok(indexSource.includes('stateVersion: 11'), '投影 stateVersion 11:按 Provider 去重并重放旧 checkpoint')
   assert.ok(indexSource.includes("if (event.type === 'session')") && indexSource.includes('createdAt') && indexSource.includes('seedLength'), '投影记录会话创建时刻与 seedLength(旧宿主兼容+多 end-seed 延迟扣除)')
   assert.ok(indexSource.includes("if (event.type === 'session/end-seed')"), '投影识别 session/end-seed fork 种子边界(issue #55)')
@@ -2737,7 +2836,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   }
   // ⑤ 接线:index.js 使用 createLlmStreamBilling 且 migrations 门控 provider-dedup-v1。
   {
-    const indexSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+    const indexSource = readHostModule('index.js')
     assert.ok(indexSource.includes('createLlmStreamBilling('), 'index.js 接入 createLlmStreamBilling(嵌套去重监听器)')
     assert.ok(indexSource.includes('repairProviderDupes(ledger)') && indexSource.includes("'provider-dedup-v1'"), '启动导入接入一次性清洗(migrations 标记防重跑)')
   }
@@ -2960,11 +3059,11 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   assert.equal(Object.values(Object.values(plain70.days)[0])[0].calls, 1, '无包装直连回放恰记一次')
   // 9) 接线:index.js 实时钩子走指纹窗口去重(包装层改挂上游,不再一律丢弃,
   // issue #76)+ 投影改挂去重 + 启动清洗迁移门控。
-  const indexSrc70 = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const indexSrc70 = readHostModule('index.js')
   assert.ok(indexSrc70.includes('usageDeduper.admit(sessionId, model, provider, buckets, atMs)'), '实时 llm/stream 计费回调经指纹窗口去重入账(包装层单链不再漏计)')
   assert.ok(indexSrc70.includes('isWrapperProviderId(rawProvider)') && indexSrc70.includes('wrapperUpstreamProvider(rawProvider) ?? rawProvider'), 'costUsage 投影对包装层 provider 改挂上游(不再一律跳过)')
   assert.ok(indexSrc70.includes('dedupeWrapperProviderDays(ledger.days') && indexSrc70.includes("'modlens-wrapper-dedup-v1'"), '启动清洗接入一次性迁移(migrations 标记防重跑)')
-  const backfillSrc70 = readFileSync(new URL('../lib/backfill.js', import.meta.url), 'utf8')
+  const backfillSrc70 = readHostModule('backfill.js')
   assert.ok(backfillSrc70.includes('isWrapperProviderId(sampleProvider)') && backfillSrc70.includes('wrapperUpstreamProvider(sampleProvider)'), '回放器对包装层样本改挂上游 + 指纹窗口判定')
   console.log('[ok] modlens 包装层去重(id 判定/四形态清洗/幂等/保守分支/回放单记/接线)通过')
 }
@@ -2972,7 +3071,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
 // 8h-2) v1.6.7:峰谷生效时刻锚点修复(同步重置致峰时历史半价)+ 币种切换全量换基准。
 {
   // A-1) 源哨兵:页面无生效时间时不再把 peakEffectiveAt 重置为「同步时刻」。
-  const idxSrc167 = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const idxSrc167 = readHostModule('index.js')
   assert.ok(!idxSrc167.includes('patch.peakEffectiveAt = new Date()'), 'fetchPrices 不再把无生效时间的同步重置为 new Date()(半价根因已删)')
   assert.ok(idxSrc167.includes("typeof parsed.effectiveAt === 'string' && !Number.isNaN(Date.parse(parsed.effectiveAt))"), '仅页面带合法生效时间才更新 peakEffectiveAt')
 
@@ -3212,11 +3311,11 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   const ledger36c = new Ledger(cfg36, {}, join(root36, 'ledger-c.json'))
   assert.equal(ledger36c.todayOfficialCost(), 0, '无今日记录返回 0')
   // 源结构断言:index.js 对账改用官方渠道费用;client.js 官方分支走 todayOfficialUsd,自定义分支维持全量。
-  const idxSrc36 = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const idxSrc36 = readHostModule('index.js')
   assert.ok(idxSrc36.includes('const todayCost = ledger.todayOfficialCost() + (externalCost ?? 0)'), '对账合计官方渠道与当天外部费用(issue #185)')
   assert.ok(!idxSrc36.includes('ledger.today().cost, localDayKey'), '对账不再使用全渠道今日合计')
   const cliSrc36 = readClientSource()
-  assert.ok(cliSrc36.includes('function todayOfficialUsd(state)'), 'client.js 定义 todayOfficialUsd')
+  assert.ok(cliSrc36.includes('function todayOfficialUsd('), 'client.js 定义 todayOfficialUsd')
   assert.ok(cliSrc36.includes("mode === 'official' ? todayOfficialUsd(state) : Number(state.today?.cost) || 0"), '官方余额分支使用官方渠道费用,自定义分支维持全量')
   assert.ok(cliSrc36.includes("if (provider.startsWith('llm-')) provider = provider.slice(4)"), 'client 端剥离 llm- 包装路由前缀(与 officialCostOfDay 同口径)')
   console.log('[ok] 官方渠道费用拆分(纯函数/Ledger 聚合/对账与进度条接线/旧数据退回)通过')
@@ -3669,7 +3768,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   const patched = applyConfigPatch(ledger.config, { locale: 'en' })
   assert.ok(patched.config.legacyAutoImportedAt > 0, '配置补丁后标记保真')
   // 宿主接线:apply 的启动定时器调用 runStartupImports。
-  const hostSource = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const hostSource = readHostModule('index.js')
   assert.ok(hostSource.includes('runStartupImports(ledger, join(resolveDshHome(), \'sessions\'))'), 'apply 启动定时器接线自动导入')
   rmSync(autoRoot, { recursive: true, force: true })
   if (prevHome === undefined) delete process.env.DSH_HOME
@@ -3754,8 +3853,8 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   assert.ok(planSrc.includes("entry.display !== 'sidebar' && entry.display !== 'both'"), '侧边栏门控 display=sidebar/both')
   assert.ok(planSrc.includes('el(MiniMaxPlanBox, { state, wide, api: props.api })'), 'MiniMax 沿用专用 5h/7d 卡片(issue #37 起透传 api 支持点击刷新)')
   assert.ok(planSrc.includes('el(CodingPlanBox, { id, state, wide, api: props.api })'), '其余厂商走通用 CodingPlanBox')
-  assert.ok(planSrc.includes('function CodingPlanBox(props)'), '通用卡片组件定义存在')
-  assert.ok(planSrc.includes('function codingPlanWindowLabel(name, t)'), '窗口名本地化(fiveHour/weekly/monthly)')
+  assert.ok(planSrc.includes('function CodingPlanBox('), '通用卡片组件定义存在')
+  assert.ok(planSrc.includes('function codingPlanWindowLabel('), '窗口名本地化(fiveHour/weekly/monthly)')
   // 通用卡片样式:宽标签与文本窗口行的 CSS。
   assert.ok(planSrc.includes('.cm-mm-row.wide .cm-bbox-label{') && planSrc.includes('.cm-mm-row.wide .cm-mm-text{'), '通用卡片行样式存在')
   console.log('[ok] Coding Plan 侧边栏显示(display 门控/通用卡片/双语文案/设置页下拉)通过')
@@ -3766,7 +3865,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   const src = readClientSource()
   // issue #57:MiniMax 卡片改为「已用」方向填充,与通用卡片/额度横条一致;余量换算函数移除。
   assert.ok(!src.includes('miniMaxRemainPct') && !src.includes('miniMaxRemainLevel'), 'issue #57: 余量口径渲染路径已删除')
-  assert.ok(src.includes('function planWindowUsedPct(win)'), 'issue #57: 已用百分比 helper 存在')
+  assert.ok(src.includes('function planWindowUsedPct('), 'issue #57: 已用百分比 helper 存在')
   const mmBody = src.slice(src.indexOf('function miniMaxRow('), src.indexOf('function MiniMaxPlanCard('))
   assert.ok(mmBody.includes("pct >= 100 ? 'over' : pct >= 80 ? 'warn' : 'ok'"), 'issue #57: MiniMax 告警阈值与 CodingPlanBox 同口径')
   // issue #57 口径保留(默认已用方向),#67 新增方向可翻转:按 direction 换算后填充(默认仍为已用)。
@@ -3774,15 +3873,16 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   // issue #59-1:充值直达链接。
   // CodeQL #7 误报:这是断言源码里「充值链接字符串存在」的存在性检查,并非用子串匹配做 URL 净化。
   assert.ok(src.includes("https://platform.deepseek.com/usage"), 'issue #59: DeepSeek 充值页 URL 在册') // codeql[js/incomplete-url-substring-sanitization]
-  assert.equal([...src.matchAll(/rechargeLinkEl\(t\)/g)].length, 3, 'issue #59: 充值链接在 helper 定义与余额行/图框两处渲染共出现三次')
+  // TS 源码给形参标了类型(rechargeLinkEl(t: any)),出现次数口径不变(定义 + 两处渲染)。
+  assert.equal([...src.matchAll(/rechargeLinkEl\(t(?:: any)?\)/g)].length, 3, 'issue #59: 充值链接在 helper 定义与余额行/图框两处渲染共出现三次')
   assert.ok(src.includes('.cm-bal-link{'), 'issue #59: 充值链接样式存在')
   assert.ok(src.includes('balanceRechargeLink:') && [...src.matchAll(/balanceRechargeLink:/g)].length === 2, 'issue #59: 充值提示文案 zh/en 各一份')
   // issue #59-2:Codex 周额度客户端探测模块。
   assert.ok(src.includes("'/plugins/dsh-openai-codex/auth/status'"), 'issue #59: dsh-codex-connect 状态路由在册')
-  assert.ok(src.includes('function parseCodexStatus(data)'), 'issue #59: auth/status 解析器存在')
+  assert.ok(src.includes('function parseCodexStatus('), 'issue #59: auth/status 解析器存在')
   assert.ok(src.includes("data.status !== 'signed-in'") && src.includes('Number(w.windowSeconds) === CODEX_WEEK_SECONDS'), 'issue #59: 仅接受已登录的 codex 周窗口')
   assert.ok(src.includes('100 - Number(win.remainingPercent)'), 'issue #59: remainingPercent 折算为已用口径(与 #57 一致)')
-  assert.ok(src.includes('function CodexPlanBox(props)'), 'issue #59: Codex 侧边栏卡片组件存在')
+  assert.ok(src.includes('function CodexPlanBox('), 'issue #59: Codex 侧边栏卡片组件存在')
   assert.ok(src.includes('!codexOn && !budgetOn'), 'issue #59: SidebarFooter 门控纳入 codexOn')
   assert.ok(src.includes("key: 'codex',"), 'issue #59: 额度横条 Codex chip 接线')
   assert.ok(src.includes('codexQuotaTitle:') && [...src.matchAll(/codexQuotaTitle:/g)].length === 2, 'issue #59: Codex 标题文案 zh/en 各一份')
@@ -4315,7 +4415,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   assert.equal(suggestPlanAutoClasses(autoDays, explicitCfg).includes('minimax'), false, '用户显式配置(api)不被翻转')
   assert.equal(suggestPlanAutoClasses(autoDays, autoCfg).includes('openrouter'), false, '默认 api 类厂商(openrouter)不参与静默归类')
   // 宿主接线:启动迁移标记与 updateConfig 自动重算钩子存在。
-  const indexSrc = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const indexSrc = readHostModule('index.js')
   assert.ok(indexSrc.includes("includes('plan-autodetect-v1')"), 'plan-autodetect-v1 迁移标记接线')
   assert.ok(indexSrc.includes('suggestPlanAutoClasses'), '宿主调用归类建议函数')
   assert.ok(/patch\.planBilling !== undefined \|\| patch\.codingPlans !== undefined \|\| patch\.goQuota !== undefined/.test(indexSrc), 'updateConfig 触碰分类相关键即重算 apiCost')
@@ -4518,7 +4618,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   assert.equal(swpOk.errors.length, 0 && swpOk.config.showTotalWithPlan, true, '合法布尔生效')
   assert.equal(sanitizeConfig({ showTotalWithPlan: 'bogus' }).showTotalWithPlan, false, '非法值清洗回默认')
   // host budgetUsed 分支接线。
-  const indexSrcV16 = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const indexSrcV16 = readHostModule('index.js')
   assert.ok(/showTotalWithPlan === true/.test(indexSrcV16) && /budgetCostOf/.test(indexSrcV16), 'host budgetUsed 按开关分支')
   // 客户端接线:displayCostOf 替换全部金额消费点 + 读侧白名单 + 设置勾选。
   const clientSrcV16 = readClientSource()
@@ -4837,16 +4937,13 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   // 4) 客户端计费助手与服务端同口径(行为级漂移防护):从 src/client/ 拼接源码抽取纯助手
   //    区段在 Node 求值,同一价表/同一时刻断言两侧档位与金额一致。
   {
-    const clientSrc = readClientSource()
-    const sliceStart = clientSrc.indexOf('function priceEntryFor(modelId, table)')
-    const sliceEnd = clientSrc.indexOf('function makeStore(initial,')
-    const todayStart = clientSrc.indexOf('function todayOfficialUsd(state)')
-    const todayEnd = clientSrc.indexOf('function todayUsedInBalanceCurrency(')
-    assert.ok(sliceStart > 0 && sliceEnd > sliceStart && todayStart > 0 && todayEnd > todayStart, '客户端计费助手区段定位成功(函数改名时同步本测试)')
-    const C = new Function(
-      clientSrc.slice(sliceStart, sliceEnd) + '\n' + clientSrc.slice(todayStart, todayEnd)
-      + '\nreturn { priceEntryFor, normalizeClientPrice, tierFor, costOfBuckets, usdFromCostLocal, formatMoneyValue, weekendZoneAt, isPeakHour, todayOfficialUsd }',
-    )()
+    // 客户端镜像改为现场打包 src/client/logic.ts + today.ts(产物不导出这些内部符号;
+    // 源码已迁 ES 模块,旧的「切片 + new Function」对 export 关键字与跨模块常量不再可行)。
+    for (const [source, names] of [
+      [clientLogic, ['priceEntryFor', 'normalizeClientPrice', 'tierFor', 'costOfBuckets', 'usdFromCostLocal', 'formatMoneyValue', 'weekendZoneAt', 'isPeakHour']],
+      [clientBalance, ['todayOfficialUsd']],
+    ]) for (const name of names) assert.equal(typeof source[name], 'function', '客户端计费助手区段定位成功(函数改名时同步本测试): ' + name)
+    const C = { ...clientLogic, ...clientBalance }
     // 4a) 子档保留:normalizeClientPrice 不再剥 offPeak/peak/legacyBase(修复前恒为 undefined)。
     const entry = {
       cacheHit: 0.007, cacheMiss: 0.22, output: 0.66,
@@ -4957,11 +5054,9 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
 
   // 3) 客户端错位判定行为(经助手区段抽取求值,函数改名时同步本测试)。
   {
-    const clientSrcTz = readClientSource()
-    const sliceStartTz = clientSrcTz.indexOf('function priceEntryFor(modelId, table)')
-    const sliceEndTz = clientSrcTz.indexOf('function makeStore(initial,')
-    assert.ok(sliceStartTz > 0 && sliceEndTz > sliceStartTz, '客户端助手区段定位成功')
-    const CTz = new Function(clientSrcTz.slice(sliceStartTz, sliceEndTz) + '\nreturn { formatTzOffset, timezoneMismatchOf }')()
+    // 3) 客户端错位判定行为(现场打包 src/client/logic.ts 取同一实现;函数改名时同步本测试)。
+    for (const name of ['formatTzOffset', 'timezoneMismatchOf']) assert.equal(typeof clientLogic[name], 'function', '客户端助手区段定位成功: ' + name)
+    const CTz = clientLogic
     assert.equal(CTz.formatTzOffset(480), 'UTC+8', 'formatTzOffset 整小时')
     assert.equal(CTz.formatTzOffset(-300), 'UTC-5', 'formatTzOffset 负偏移')
     assert.equal(CTz.formatTzOffset(330), 'UTC+5:30', 'formatTzOffset 半小时偏移')
@@ -4982,10 +5077,11 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
     const clientSrcTzWire = readClientSource()
     assert.ok(clientSrcTzWire.includes("t('timezoneHint'"), '概览页接线时区错位提示')
     assert.ok(clientSrcTzWire.includes("timezone: typeof v.meta?.timezone === 'string' ? v.meta.timezone : ''"), '客户端解析 meta.timezone')
-    const idxSrcTz = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+    const idxSrcTz = readHostModule('index.js')
     assert.ok(idxSrcTz.includes('function hostTimezone()'), '宿主 hostTimezone 助手存在')
-    assert.ok(idxSrcTz.includes('...(hostTimezone() ? { timezone: hostTimezone() } : {})'), '宿主有值才下发 timezone 键(网关拒绝显式 undefined)')
-    const tySrcTz = readFileSync(new URL('../lib/typert.host.js', import.meta.url), 'utf8')
+    // rolldown 会把 `...(a ? b : {})` 打印成 `...a ? b : {}`(语义等价,只少一层包裹括号)。
+    assert.ok(/\.\.\.\(?hostTimezone\(\) \? \{ timezone: hostTimezone\(\) \} : \{\}\)?/.test(idxSrcTz), '宿主有值才下发 timezone 键(网关拒绝显式 undefined)')
+    const tySrcTz = readHostModule('typert.host.js')
     assert.ok(tySrcTz.includes('timezone: z.string().optional()'), 'stateSchema meta.timezone 可选键')
   }
 
@@ -5190,12 +5286,15 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
 
 // 11-6) 今日费用实时化接线源哨兵:serve-stale + 客户端投影联动刷新。
 {
-  const idx11 = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const idx11 = readHostModule('index.js')
   assert.ok(idx11.includes('kick(balanceCache.fetchedAt > 0'), 'serve-stale:有过快照时余额刷新转后台')
   assert.ok(idx11.includes('task.catch(() => {})'), 'serve-stale:后台任务拒绝被吞掉(无 unhandled rejection)')
   const client11 = readClientSource()
-  assert.ok(client11.includes('function useProjectionRefresh(props, usage)'), '客户端投影联动刷新 hook 存在')
-  assert.ok((client11.match(/useProjectionRefresh\(props, /g) || []).length >= 3, '会话徽章(dock/header)与侧边栏页脚三处挂载(覆盖 position=off)')
+  assert.ok(client11.includes('function useProjectionRefresh('), '客户端投影联动刷新 hook 存在')
+  // 迁移后徽章的投影联动收口到共享 useSessionUsage(SessionCost/DockLine 各一处),
+  // 页脚仍直接调用 → 三处挂载语义不变。
+  assert.ok((client11.match(/useProjectionRefresh\(props, /g) || []).length >= 2, '投影联动刷新接入共享会话 hook 与侧边栏页脚')
+  assert.ok((client11.match(/useSessionUsage\(/g) || []).length >= 3, '会话徽章(dock/header)与侧边栏页脚三处挂载(覆盖 position=off)')
   assert.ok(client11.includes("setTimeout(() => { props.api?.reload?.() }, 800)"), '800ms 防抖后触发 getState 重载(今日费用 ≈1s 更新)')
   console.log('[ok] 今日费用实时化接线哨兵(serve-stale/投影联动刷新)通过')
 }
@@ -5283,10 +5382,9 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
 // 11-9) 客户端镜像一致性 + UI 接线哨兵(本地判定双侧同输入同结果)。
 {
   const clientSrc11 = readClientSource()
-  const sliceStart11 = clientSrc11.indexOf('function priceEntryFor(modelId, table)')
-  const sliceEnd11 = clientSrc11.indexOf('function makeStore(initial,')
-  assert.ok(sliceStart11 > 0 && sliceEnd11 > sliceStart11, '客户端价格区段定位成功')
-  const C11 = new Function(clientSrc11.slice(sliceStart11, sliceEnd11) + '\nreturn { resolveClientPrice, isLocalOriginClient }')()
+  // 客户端镜像:现场打包 src/client/logic.ts(函数改名时同步本测试)。
+  for (const name of ['resolveClientPrice', 'isLocalOriginClient']) assert.equal(typeof clientLogic[name], 'function', '客户端价格区段定位成功: ' + name)
+  const C11 = clientLogic
   const prices11m = sanitizeConfig({}).prices
   const matchConfig11 = { prices: prices11m, priceMatch: 'auto' }
   // ① 哨兵(客户端):priced=false 且视为已人工指定(不进未命中列表)。
@@ -5661,7 +5759,7 @@ console.log('[ok] OpenRouter/SiliconFlow/CommandCode 解析器与白名单通过
   const client79 = readClientSource()
   assert.ok(client79.includes('function CustomBalanceEntryPanel('), '设置页逐条编辑组件存在')
   assert.ok(client79.includes("t('customBalanceAdd')") && client79.includes("t('quotaRemove')"), '添加/删除条目按钮接线(双语)')
-  assert.ok(client79.includes('function visibleCustomEntries(state, config)'), '侧边栏可见条目统一判定 helper 存在')
+  assert.ok(client79.includes('function visibleCustomEntries('), '侧边栏可见条目统一判定 helper 存在')
   assert.ok(client79.includes('api.refreshCustomBalance(index)'), '侧边栏逐条按 index 刷新')
   assert.ok(client79.includes('const visibleCustom = visibleCustomEntries(state, config)'), 'SidebarFooter 用可见条目集门控')
   assert.ok(client79.includes('costMeter.refreshCustomBalance(index)'), 'RPC 层透传 index 参数')
@@ -5676,13 +5774,17 @@ await import('./typert-codecs.mjs')
 
 // 15-1) 源级:cost 参数按余额账户币种同币种化(CNY 账户折算为 ¥ 并附 ≈USD)。
 {
-  const idx81 = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+  const idx81 = readHostModule('index.js')
   assert.ok(idx81.includes('const nativeCost = event =>'), 'nativeCost 助手存在(本地费用按账户币种显示)')
-  assert.ok(idx81.includes("'¥' + cny.toFixed(4) + '（≈' + usd(event.todayCost) + '）'"), 'CNY 账户:本地费用显示 ¥ 并附 ≈USD 参考')
+  // tsdown 会把单次使用的 `const cny = Number(e.todayCost) * exchangeRate` 内联进表达式,
+  // 故同时接受具名与内联两种等价形态(仍是「¥ + 折算值 + ≈USD 参考」)。
+  assert.ok(/return '¥' \+ (?:cny|\(Number\(event\.todayCost\) \* exchangeRate\))\.toFixed\(4\) \+ '（≈' \+ usd\(event\.todayCost\) \+ '）'/.test(idx81), 'CNY 账户:本地费用显示 ¥ 并附 ≈USD 参考')
   assert.ok(idx81.includes('cost: nativeCost(event)'), 'reconcileWarn 的 cost 参数走 nativeCost(不再恒用 $)')
   // 两侧对称:同一 currencyOf 判定驱动 cost 与 delta 的符号(仅此一处读取 spentCurrency)。
   assert.ok(idx81.includes('const currencyOf = event =>'), '币种判定统一 currencyOf(cost/delta 共用)')
-  assert.equal((idx81.match(/spentCurrency/g) ?? []).length, 1, 'spentCurrency 仅在 currencyOf 一处读取(防口径漂移)')
+  // 只数「读取」点(event?.spentCurrency):store 里两处 `spentCurrency:` 是事件字段写入,
+  // 判定口径仍只在 currencyOf 一处读取,语义不变。
+  assert.equal((idx81.match(/\.spentCurrency\b/g) ?? []).length, 1, 'spentCurrency 仅在 currencyOf 一处读取(防口径漂移)')
   console.log('[ok] 对账警告币种符号一致(源级接线)通过')
 }
 
@@ -5758,10 +5860,9 @@ await import('./typert-codecs.mjs')
 // 16-1) cacheUnreportedOf 判定:量级阈值(多轮长上下文恒零命中才标);真零命中不误标。
 {
   const clientSrc163 = readClientSource()
-  const sliceStart163 = clientSrc163.indexOf('function priceEntryFor(modelId, table)')
-  const sliceEnd163 = clientSrc163.indexOf('function makeStore(initial,')
-  assert.ok(sliceStart163 > 0 && sliceEnd163 > sliceStart163, '客户端可测区段定位成功')
-  const C163 = new Function(clientSrc163.slice(sliceStart163, sliceEnd163) + '\nreturn { cacheUnreportedOf }')()
+  // 客户端镜像:现场打包 src/client/logic.ts(函数改名时同步本测试)。
+  assert.equal(typeof clientLogic.cacheUnreportedOf, 'function', '客户端可测区段定位成功: cacheUnreportedOf')
+  const C163 = clientLogic
   // 疑似未上报:≥3 次调用、非缓存输入 ≥100k、缓存读恒 0。
   assert.equal(C163.cacheUnreportedOf({ calls: 5, input: 300_000, cacheRead: 0 }), true, '多轮长上下文恒零命中 → 疑似未上报')
   assert.equal(C163.cacheUnreportedOf({ calls: 10, input: 500_000, cacheRead: 0, cacheWrite: 0 }), true, '含 cacheWrite=0 同判')

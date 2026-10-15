@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { mkdtempSync, rmSync, readFileSync, readdirSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
+import { build } from 'esbuild'
+
 import { fetchWithRetry, readJsonBounded, looksLikeSecretHeaderValue } from '../lib/net.js'
 import { queryCustomBalance } from '../lib/custom-balance.js'
 import { cpaManagementFetch } from '../lib/gateway-quotas.js'
@@ -11,6 +13,26 @@ import { scnetTokenPlanWindows, SCNET_TOKEN_PLAN_PROVIDER_IDS, SCNET_CREDIT_RATE
 import { planProviderIdOf, billingClassOf } from '../lib/plan-billing.js'
 import { stripSecrets, Ledger, sanitizeConfig } from '../lib/store.js'
 import { apply, migrateCustomBalanceHeaderSecrets, runStartupImports } from '../lib/index.js'
+
+/**
+ * 现场打包客户端模块并取回导出。
+ *
+ * 旧 `src/client/*.js` 拼接片段已删,测试不再拼接源码;这里把与 `lib/` 产物同源的
+ * `src/client/*.ts` 打成临时 CJS(平台种子保持 external,由调用方注入桩)后 require,
+ * 取同一实现。NodeNext 的 `.js` 后缀导入也只有打包器能解析。
+ */
+async function clientExports(entry, seeds = {}) {
+  const result = await build({
+    stdin: { contents: entry, resolveDir: fileURLToPath(new URL('../src/client/', import.meta.url)), loader: 'js' },
+    bundle: true, write: false, platform: 'node', format: 'cjs', logLevel: 'silent',
+    external: ['react', 'react-dom', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives'],
+  })
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', result.outputFiles[0].text)(
+    id => { if (id in seeds) return seeds[id]; throw new Error('missing seed module: ' + id) }, module, module.exports)
+  return module.exports
+}
+
 
 // 响应体按实际流大小截断，即使未声明长度或谎报长度也不能无限读取。
 let cancelled = false, chunks = 0
@@ -88,13 +110,7 @@ assert.equal(migration.pending.length, 1)
 assert.equal(pendingLedger.config.customBalances[0].request.headers.Authorization, mixed, '运行期仍保留原模板')
 
 // 前后端都识别明确的 SCNet 订阅别名，同名模型经其他渠道不消耗本地 SCNet Credits。
-const dir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(dir).filter(n => n.endsWith('.js')).sort().map(n => readFileSync(new URL(n, dir), 'utf8')).join('')
-let factory
-vm.runInNewContext(source.replace('exports.apply = apply', 'exports.test = { planProviderIdOfLocal, billingClassOfLocal }; exports.apply = apply'), {
-  window: { __ModuleLoader__: { load: v => { factory = v.factory } }, localStorage: { getItem: () => null } }, navigator: { language: 'en' },
-})
-const client = factory(() => ({})).test
+const client = await clientExports(`export { planProviderIdOfLocal, billingClassOfLocal } from './logic.js'`)
 const cfg = sanitizeConfig({ codingPlans: { scnet: { enabled: true } } })
 for (const provider of [...SCNET_TOKEN_PLAN_PROVIDER_IDS, 'LLM-SCNET-TOKEN-PLAN']) {
   assert.equal(planProviderIdOf(provider), 'scnet')

@@ -1,24 +1,76 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { build as esbuild } from 'esbuild'
 import { stateSchema } from '../lib/typert.host.js'
 import { sanitizeConfig, applyConfigPatch, Ledger } from '../lib/store.js'
 
-const sourceDir = new URL('../src/client/', import.meta.url)
-const source = readdirSync(sourceDir).filter(name => name.endsWith('.js')).sort().map(name => readFileSync(new URL(name, sourceDir), 'utf8')).join('')
-const expose = ['SidebarModelCosts', 'ModelSidebarSettings', 'sidebarModelRows', 'modelStatsRows', 'MODEL_SIDEBAR_DEFAULTS', 'MODEL_OPEN_KEY', 'QuotaCard', 'useQuotaRefresh', 'QuotasSection', 'PlanQuotaCard', 'GatewayQuotaCard', 'GoQuotaCard', 'GoQuotaSettings', 'CustomBalanceEntryPanel', 'SidebarFooter', 'CornerChips', 'parseConfig', 'makeT', 'CODING_PLAN_ROWS']
-expose.push('CostSection', 'MiniMaxPlanCard')
-expose.push('BalancePanel', 'CredentialField', 'parseBalance')
+/**
+ * 构建客户端 bundle 一次;每个 environment() 复制成独立文件再 import,复刻旧 vm
+ * 沙箱「每个环境独立模块状态 + 独立全局」的语义:打包时用 banner 把 window/document/
+ * fetch/计时器/Date 绑定到 globalThis.__cmEnv(实例化前设置),宿主仍用真实全局。
+ * 源码已是 ES 模块(旧片段已删):parseConfig 未 export,打包时追加等价 export。
+ */
+const CLIENT_ENV_BANNER = 'const __cmEnv = globalThis.__cmEnv ?? {}\n'
+  + 'const Date = __cmEnv.Date ?? globalThis.Date\n'
+  + 'const window = __cmEnv.window\n'
+  + 'const document = __cmEnv.document\n'
+  + 'const navigator = __cmEnv.navigator ?? globalThis.navigator\n'
+  + 'const fetch = __cmEnv.fetch\n'
+  + 'const setTimeout = __cmEnv.setTimeout\n'
+  + 'const clearTimeout = __cmEnv.clearTimeout\n'
+  + 'const setInterval = __cmEnv.setInterval\n'
+  + 'const clearInterval = __cmEnv.clearInterval\n'
+  + 'const AbortSignal = __cmEnv.AbortSignal ?? globalThis.AbortSignal\n'
+let clientBundlePath = null
+let clientInstanceSeq = 0
+async function instantiateClient() {
+  if (clientBundlePath === null) {
+    const work = mkdtempSync(join(tmpdir(), 'cm-quota-cards-'))
+    const reactStub = join(work, 'react-stub.cjs')
+    const primitivesStub = join(work, 'primitives-stub.cjs')
+    writeFileSync(reactStub, 'const base = { Fragment: "fragment", createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),'
+      + ' useState: value => [typeof value === "function" ? value() : value, () => {}], useEffect: () => {}, useRef: value => ({ current: value ?? null }),'
+      + ' useMemo: fn => fn(), useCallback: fn => fn, useSyncExternalStore: (_sub, get) => get() }\n'
+      + 'const R = Object.assign({}, base, globalThis.__cmReactStub ?? {})\nmodule.exports = R\nmodule.exports.default = R\n')
+    writeFileSync(primitivesStub, 'module.exports = { Tooltip: "Tooltip", Button: "Button" }\nmodule.exports.default = module.exports\n')
+    const entry = join(work, 'entry.ts')
+    writeFileSync(entry, ['constants', 'logic', 't', 'ui-shared', 'ui-credential', 'ui-balance', 'ui-custom-balance', 'ui-corner', 'ui-quota', 'ui-sidebar-models', 'ui-sidebar', 'settings', 'index']
+      .map(name => `export * from ${JSON.stringify(fileURLToPath(new URL(`../src/client/${name}.ts`, import.meta.url)))}\n`).join(''))
+    const outfile = join(work, 'bundle.cjs')
+    await esbuild({
+      entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', outfile, logLevel: 'silent',
+      banner: { js: CLIENT_ENV_BANNER },
+      alias: { react: reactStub, '@deepseek-ai/dsh-client-ui-primitives': primitivesStub },
+      plugins: [{
+        name: 'expose-private',
+        setup(build) {
+          build.onLoad({ filter: /logic\.ts$/ }, args => {
+            const source = readFileSync(args.path, 'utf8')
+            const missing = ['parseConfig'].filter(name => !new RegExp(`export (?:function|const|let|class) ${name}\\b`).test(source))
+            return { contents: missing.length > 0 ? source + `\nexport { ${missing.join(', ')} }\n` : source, loader: 'ts' }
+          })
+        },
+      }],
+    })
+    clientBundlePath = outfile
+  }
+  const copy = clientBundlePath.replace(/\.cjs$/, `-${++clientInstanceSeq}.cjs`)
+  copyFileSync(clientBundlePath, copy)
+  const mod = await import(pathToFileURL(copy).href)
+  return mod.default ?? mod
+}
+
 const element = (type, props, ...children) => ({ type, props: props ?? {}, children })
 const nodes = value => Array.isArray(value) ? value.flatMap(nodes) : value && typeof value === 'object' ? [value, ...nodes(value.children)] : []
 const textOf = value => Array.isArray(value) ? value.map(textOf).join(' ') : value && typeof value === 'object' ? textOf(value.children) : typeof value === 'string' || typeof value === 'number' ? String(value) : ''
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 
 // 每个实例拥有自己的 hook 槽位;effect 依赖变化先 cleanup,异步 setState 支持函数更新。
-function environment(fetchImpl = async () => ({ ok: false })) {
-  let factory, current, nextTimer = 0, now = 0
+async function environment(fetchImpl = async () => ({ ok: false })) {
+  let current, nextTimer = 0, now = 0
   const doc = { hidden: false, visibilityState: 'visible', querySelector: () => ({}), addEventListener() {}, removeEventListener() {} }
   class Clock extends Date { static now() { return now } }
   const storage = new Map(), timers = new Map(), requests = []
@@ -47,15 +99,21 @@ function environment(fetchImpl = async () => ({ ok: false })) {
       }
     },
   }
-  vm.runInNewContext(source.replace('exports.apply = apply', `exports.test = { ${expose.join(', ')} }; exports.apply = apply`), {
-    navigator: { language: 'en' }, console, AbortSignal, document: doc, Date: Clock,
-    window: { __ModuleLoader__: { load: value => { factory = value.factory } }, localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)) } },
+  // 旧 vm 沙箱的等价物:客户端模块读到的 React / window / document / fetch / 计时器 / 时钟
+  // 都由本环境提供(banner 在实例化时绑定),互不串味、也不污染宿主与其它测试。
+  globalThis.__cmReactStub = React
+  globalThis.__cmEnv = {
+    Date: Clock, window: { localStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)) } },
+    document: doc, navigator: { language: 'en' }, AbortSignal,
     fetch: (...args) => { requests.push(args); return fetchImpl(...args) },
     setTimeout: (fn, delay) => schedule(fn, delay, false), clearTimeout: id => timers.delete(id),
     setInterval: (fn, delay) => schedule(fn, delay, true), clearInterval: id => timers.delete(id),
-  })
-  const module = factory(name => name === 'react' ? React : { Tooltip: 'tooltip' })
-  const ui = module.test
+  }
+  const module = await instantiateClient()
+  const ui = module
+  for (const name of ['SidebarModelCosts', 'ModelSidebarSettings', 'sidebarModelRows', 'modelStatsRows', 'MODEL_SIDEBAR_DEFAULTS', 'MODEL_OPEN_KEY', 'QuotaCard', 'useQuotaRefresh', 'QuotasSection', 'PlanQuotaCard', 'GatewayQuotaCard', 'GoQuotaCard', 'GoQuotaSettings', 'CustomBalanceEntryPanel', 'SidebarFooter', 'CornerChips', 'parseConfig', 'makeT', 'CODING_PLAN_ROWS', 'CostSection', 'MiniMaxPlanCard', 'BalancePanel', 'CredentialField', 'parseBalance']) {
+    assert.ok(ui[name] !== undefined, '客户端符号可取: ' + name)
+  }
   const instances = []
   const mount = (render, props = {}) => {
     const owner = { hooks: [], cursor: 0, effects: [], dirty: false, disposed: false, props, tree: null }
@@ -99,11 +157,11 @@ const input = (tree, label) => nodes(tree).find(n => n.type === 'input' && n.pro
 const base = sanitizeConfig({ locale: 'en', currency: 'USD', symbol: '$', exchangeRate: 1, decimals: 2,
   position: 'off', sidebar: false, hideTodayCost: true, hideOfficialBalance: true, goQuota: { enabled: false },
   budget: { enabled: false }, peakEnabled: false, corner: { enabled: false } })
-const e = environment(), t = e.ui.makeT('en')
+const e = await environment(), t = e.ui.makeT('en')
 
 // #159: sidebar/reset countdown, rail infinity, minute updates and cleanup.
 {
-  const timerEnv = environment(), start = Date.parse('2026-09-22T00:00:00Z')
+  const timerEnv = await environment(), start = Date.parse('2026-09-22T00:00:00Z')
   timerEnv.setNow(start)
   const five = { percent: 25, resetsAt: new Date(start + 90 * 60000).toISOString() }
   const seven = { unlimited: true, text: '∞', resetsAt: '' }
@@ -334,7 +392,7 @@ for (const settings of [goSettings, planRows.tree.props.configNode]) {
 }
 
 // 实际 activate API：共享快照计时器、隐藏页面门控、slot 注册和 RPC 返回传播。
-const activation = environment(), registered = new Map(), cleanups = []
+const activation = await environment(), registered = new Map(), cleanups = []
 let getCalls = 0, remoteResult = { ok: true, value: { ok: true, message: 'done' } }, remoteArgs
 let live = { ...state, config: { ...base, sidebarModels: { ...base.sidebarModels, enabled: true, dock: true, refreshSeconds: 10 } } }
 const remote = new Proxy({ getState: async () => { getCalls++; return { ok: true, value: live } } }, {
@@ -372,7 +430,7 @@ activation.setNow(30000); await activation.tick(1000); assert.equal(getCalls, 4,
 stop(); for (const cleanup of cleanups.reverse()) cleanup()
 assert.equal(activation.timers.size, 0, '卸载清理轮询')
 // #154: first RPC can race hot installation. Real client apply/store + fake clock.
-const startup = environment(), startupCleanups = [], startupSlots = new Map(), startupEvents = new Map()
+const startup = await environment(), startupCleanups = [], startupSlots = new Map(), startupEvents = new Map()
 let startupCalls = 0, pending, available = false
 const startupState = { ...live, config: base }
 const startupRemote = { getState: async () => {
@@ -447,7 +505,7 @@ console.log('[ok] #154 client: startup backoff, error/retry UI, recovery, concur
 
 // #201: dedicated balance key input, source status and refresh concurrency.
 for (const locale of ['zh', 'en']) {
-  const env = environment(), t = env.ui.makeT(locale)
+  const env = await environment(), t = env.ui.makeT(locale)
   const balance = env.ui.parseBalance({ status: 'error', message: 'HTTP 401', keyConfigured: true, keySource: 'file' }, 'balance')
   const calls = [], request = deferred()
   const api = {

@@ -1,18 +1,38 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { readFileSync, readdirSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 import { sanitizeConfig } from '../lib/store.js'
 
-const dir = new URL('../src/client/', import.meta.url)
-const src = readdirSync(dir).filter(n => n.endsWith('.js')).sort().map(n => readFileSync(new URL(n, dir), 'utf8')).join('')
-let factory
+/**
+ * 现场打包客户端模块并取回导出。
+ *
+ * 旧 `src/client/*.js` 拼接片段已删,测试不再拼接源码;这里把与 `lib/` 产物同源的
+ * `src/client/*.ts` 打成临时 CJS(平台种子保持 external,由调用方注入桩;`globals`
+ * 用于替换 Date 这类全局,等价于旧 `vm.runInNewContext` 的上下文注入)后 require。
+ */
+async function clientExports(entry, seeds = {}, globals = {}) {
+  const result = await build({
+    stdin: { contents: entry, resolveDir: fileURLToPath(new URL('../src/client/', import.meta.url)), loader: 'js' },
+    bundle: true, write: false, platform: 'node', format: 'cjs', logLevel: 'silent',
+    external: ['react', 'react-dom', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives'],
+  })
+  const names = Object.keys(globals)
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', ...names, result.outputFiles[0].text)(
+    id => { if (id in seeds) return seeds[id]; throw new Error('missing seed module: ' + id) },
+    module, module.exports, ...names.map(name => globals[name]))
+  return module.exports
+}
+
 const now = Date.parse('2026-09-10T07:00:00Z')
 class Clock extends Date { static now() { return now } }
 const el = (type, props, ...children) => ({ type, props: props ?? {}, children })
-vm.runInNewContext(src.replace('exports.apply = apply', 'exports.test = { SidebarFooter, BudgetBoxContent, BalanceBox, BalanceRowContent, codexQuotaCache }; exports.apply = apply'), {
-  Date: Clock, navigator: { language: 'zh' }, window: { __ModuleLoader__: { load: v => { factory = v.factory } }, localStorage: { getItem: () => null } },
-})
-const ui = factory(name => name === 'react' ? { createElement: el, Fragment: 'fragment', useRef: value => ({ current: value }), useEffect() {}, useState: value => [typeof value === 'function' ? value() : value, () => {}] } : { Tooltip: 'tooltip' }).test
+const React = { createElement: el, Fragment: 'fragment', useRef: value => ({ current: value }), useEffect() {}, useState: value => [typeof value === 'function' ? value() : value, () => {}] }
+const ui = await clientExports(`
+  export { SidebarFooter, BudgetBoxContent } from './ui-sidebar.js'
+  export { BalanceBox, BalanceRowContent } from './ui-balance.js'
+  export { codexQuotaCache } from './ui-quota.js'
+`, { react: React, '@deepseek-ai/dsh-client-ui-primitives': { Tooltip: 'tooltip' } }, { Date: Clock })
 const render = n => Array.isArray(n) ? n.map(render) : n && typeof n === 'object'
   ? typeof n.type === 'function' ? render(n.type(n.props)) : { ...n, children: n.children.map(render) } : n
 const nodes = n => Array.isArray(n) ? n.flatMap(nodes) : n && typeof n === 'object' ? [n, ...nodes(n.children)] : []

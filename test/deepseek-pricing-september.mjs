@@ -1,28 +1,51 @@
 import assert from 'node:assert/strict'
-import vm from 'node:vm'
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { build } from 'esbuild'
 import { DEFAULT_PRICE_TABLE, DEFAULT_PRICE_TABLE_CNY, AUGUST_PRICE_TABLE, AUGUST_PRICE_TABLE_CNY,
   DEFAULT_PEAK_WINDOWS, priceAt, tierFor, costOf, normalizePrice, parsePricingHtml,
   upgradeDeepSeekPriceTable, providerPriceEntryFor, buildPriceCatalog } from '../lib/pricing.js'
-import { Ledger, sanitizeConfig, applyConfigPatch, localDayKey } from '../lib/store.js'
+import { Ledger, sanitizeConfig, applyConfigPatch, localDayKey, zeroDay } from '../lib/store.js'
 import { apply, runStartupImports, __testProjection } from '../lib/index.js'
 import { stateSchema } from '../lib/typert.host.js'
+
+/**
+ * 现场打包客户端模块并取回导出。
+ *
+ * 旧 `src/client/*.js` 拼接片段已删,测试不再拼接源码;这里把与 `lib/` 产物同源的
+ * `src/client/*.ts` 打成临时 CJS(平台种子保持 external,由调用方注入桩;`globals`
+ * 用于替换 Date 这类全局,等价于旧 `vm.runInNewContext` 的上下文注入)后 require。
+ */
+async function clientExports(entry, seeds = {}, globals = {}) {
+  const result = await build({
+    stdin: { contents: entry, resolveDir: fileURLToPath(new URL('../src/client/', import.meta.url)), loader: 'js' },
+    bundle: true, write: false, platform: 'node', format: 'cjs', logLevel: 'silent',
+    external: ['react', 'react-dom', 'react/jsx-runtime', '@deepseek-ai/dsh-client-ui-primitives'],
+  })
+  const names = Object.keys(globals)
+  const module = { exports: {} }
+  new Function('require', 'module', 'exports', ...names, result.outputFiles[0].text)(
+    id => { if (id in seeds) return seeds[id]; throw new Error('missing seed module: ' + id) },
+    module, module.exports, ...names.map(name => globals[name]))
+  return module.exports
+}
 
 const flashAt = Date.parse('2026-09-10T04:00:00Z'), proAt = Date.parse('2026-09-14T04:00:00Z')
 const peak = { enabled: true, effectiveAtMs: Date.parse('2026-08-01T00:00:00Z'), windows: DEFAULT_PEAK_WINDOWS }
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-10, `${a} != ${b}`)
 const values = entry => [entry.cacheHit, entry.cacheMiss, entry.output]
-let now = flashAt, factory, changedDraft
+let now = flashAt, changedDraft
 class Clock extends Date { static now() { return now } }
-const directory = new URL('../src/client/', import.meta.url)
-const source = readdirSync(directory).filter(n => n.endsWith('.js')).sort().map(n => readFileSync(new URL(n, directory), 'utf8')).join('')
-vm.runInNewContext(source.replace('exports.apply = apply', 'exports.test = { priceAt, tierFor, normalizeClientPrice, parseConfig, resolveClientPrice, makeT, PriceCard, catalogPriceText }; exports.apply = apply'), {
-  Date: Clock, navigator: { language: 'en' }, window: { __ModuleLoader__: { load: value => { factory = value.factory } }, localStorage: { getItem: () => null } },
-})
 const el = (type, props, ...children) => ({ type, props: props ?? {}, children })
-const ui = factory(name => name === 'react' ? { createElement: el, Fragment: 'fragment' } : {}).test
+const ui = await clientExports(`
+  export { priceAt, tierFor, normalizeClientPrice, parseState, resolveClientPrice } from './logic.js'
+  export { makeT } from './t.js'
+  export { PriceCard, catalogPriceText } from './settings.js'
+`, { react: { createElement: el, Fragment: 'fragment' }, '@deepseek-ai/dsh-client-ui-primitives': { Tooltip: 'tooltip' }, 'react-dom': { createPortal: children => children } }, { Date: Clock })
+// logic.ts 未导出 parseConfig(它是 parseState 的内部实现):经 parseState 走同一函数。
+const parseClientConfig = config => ui.parseState({ today: zeroDay('2026-09-10'), month: zeroDay('2026-09-10'), total: zeroDay('2026-09-10'), config }, 'state').config
 const nodes = node => Array.isArray(node) ? node.flatMap(nodes) : node && typeof node === 'object' ? [node, ...nodes(node.children ?? [])] : []
 
 for (const [currency, table, old, newOff, oldFlashPeak, oldProPeak] of [
@@ -36,7 +59,7 @@ for (const [currency, table, old, newOff, oldFlashPeak, oldProPeak] of [
     assert.deepEqual(values(tierFor(entry, flashAt, peak)), newOff)
     assert.deepEqual(values(tierFor(entry, flashAt + 2 * 3600000, peak)), newOff.map(v => v * 2))
     assert.deepEqual(values(tierFor(entry, Date.parse('2026-09-12T06:00:00Z'), peak)), newOff, '周末仍按新谷价')
-    const client = ui.parseConfig(config, 'config')
+    const client = parseClientConfig(config)
     for (const at of [flashAt - 1, flashAt, flashAt + 2 * 3600000, proAt - 1, proAt]) {
       const selected = ui.normalizeClientPrice(ui.resolveClientPrice('deepseek', model, client).entry)
       assert.deepEqual([...values(ui.tierFor(selected, at, peak))], values(tierFor(entry, at, peak)))
