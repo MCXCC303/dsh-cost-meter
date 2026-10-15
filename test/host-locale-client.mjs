@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import vm from 'node:vm'
 import { createRequire } from 'node:module'
@@ -22,7 +22,7 @@ const baseline = process.argv.includes('--baseline')
 const baselineRef = '77637b5b53f78719462151c99531865aa2280df3'
 const readSource = path => baseline ? execFileSync('git', ['show', baselineRef + ':' + path], { cwd: root, encoding: 'utf8' }) : readFileSync(join(root, path), 'utf8')
 const wait = () => new Promise(resolve => setTimeout(resolve, 30))
-async function scenario({ initial = 'zh', explicit = 'auto', late = false, browser = 'en-US', noService = false, metaLocale, artifact = false, malformed = false }) {
+async function scenario({ initial = 'zh', explicit = 'auto', late = false, browser = 'en-US', noService = false, metaLocale, malformed = false }) {
   const ctx = new Context()
   const registrations = new Map(), timers = new Set(), documentListeners = new Map(), windowListeners = new Map(), localeListeners = new Set()
   let active = initial, factory, mounted = 0, unmounted = 0, writes = 0, writtenPatch
@@ -31,19 +31,30 @@ async function scenario({ initial = 'zh', explicit = 'auto', late = false, brows
   let forcedDraft, hookIndex = 0
   const browserData = { language: browser }
   const React = { createElement: (type, props, ...children) => ({ type, props: { ...props, children } }), useState: initial => [forcedDraft && hookIndex++ === 0 ? forcedDraft : typeof initial === 'function' ? initial() : initial, () => {}], useEffect() {}, useRef: value => ({ current: value }), Fragment: 'Fragment' }
-  const source = artifact ? readSource('lib/client.js') : readdirSync(join(root, 'src/client')).filter(name => name.endsWith('.js')).sort().map(name => readSource('src/client/' + name)).join('')
+  const source = readSource('lib/client.js')
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: value => { factory = value.factory } }, addEventListener: (name, fn) => windowListeners.set(name, fn), removeEventListener: (name, fn) => { if (windowListeners.get(name) === fn) windowListeners.delete(name) } }, navigator: browserData,
     document: { querySelector: () => ({}), addEventListener: (name, fn) => documentListeners.set(name, fn), removeEventListener: (name, fn) => { if (documentListeners.get(name) === fn) documentListeners.delete(name) }, hidden: false, documentElement: { lang: '' } },
     setInterval: fn => { timers.add(fn); return fn }, clearInterval: fn => timers.delete(fn), queueMicrotask, AbortController, AbortSignal, console,
   })
-  let statisticsFactory
-  vm.runInNewContext(readSource(artifact ? 'lib/client.statistics.js' : 'src/statistics/index.js'), {
-    window: { __ModuleLoader__: { load: value => { statisticsFactory = value.factory } } }, navigator: browserData,
-  })
-  const statistics = statisticsFactory(() => React)
+  // 分块产物:按平台 classic-script 语义各自注册一个 factory,再用种子 require 调它。
+  // 种子用本用例的 React 桩;`react-dom` 只需要 createPortal(context 桥在 slots 缺
+  // entries 时不会启用),primitives 只需要 Tooltip。
+  const loadChunk = name => {
+    let chunkFactory
+    vm.runInNewContext(readSource('lib/' + name), {
+      window: { __ModuleLoader__: { load: value => { chunkFactory = value.factory } } }, navigator: browserData,
+    })
+    return chunkFactory(id => id === 'react' ? React
+      : id === 'react-dom' ? { createPortal: children => children }
+        : id === '@deepseek-ai/dsh-client-ui-primitives' ? { Tooltip: 'Tooltip' } : {})
+  }
+  const statistics = loadChunk('client.statistics.js')
+  // 基线提交还没有 settings 分块(启动包当时不按需加载设置页),基线分支也不会渲染它。
+  const settings = baseline ? null : loadChunk('client.settings.js')
   const requireMain = name => name === 'react' ? React : {}
-  requireMain.async = async id => { assert.equal(id, './client.statistics.js'); return statistics }
+  const chunks = { './client.statistics.js': statistics, './client.settings.js': settings }
+  requireMain.async = async id => { assert.ok(chunks[id], 'unexpected chunk ' + id); return chunks[id] }
   const main = factory(requireMain)
   class Remote extends Service {
     constructor(owner) { super(owner, 'remote'); this.costMeter = { getState: async () => ({ ok: true, value: state }), updateConfig: async patch => { writes++; writtenPatch = patch; return { ok: true, value: state } } }; this.costMeter.getLocalState = this.costMeter.getState; owner.provide('remote.costMeter', this.costMeter) }
@@ -98,7 +109,11 @@ async function scenario({ initial = 'zh', explicit = 'auto', late = false, brows
     const api = entry().options.inject().api
     forcedDraft = { ...store.getSnapshot().state.config, activeLocale: label() === 'Cost' ? 'zh' : 'en', decimals: 4 }
     hookIndex = 0
-    const settingsTree = entry().component({ api, useCost: select => select(store.getSnapshot()) })
+    // 启动包注册的 settings 分节现在是「按需分块」懒组件(启动包不能静态 import 分块,
+    // 首次渲染只返回 null 并异步取分块)。这里用等价取法:直接渲染分块导出的 CostSection
+    // ——也就是懒包装最终挂载的组件,断言意图与强制草稿机制不变。
+    const settingsSection = settings.CostSection ?? settings.mount()
+    const settingsTree = settingsSection({ api, useCost: select => select(store.getSnapshot()) })
     const settingsText = JSON.stringify(settingsTree)
     assert.ok(settingsText.includes(label() === 'Cost' ? 'Overview' : '概览'), 'dirty auto draft uses the live language rather than a stale derived field')
     forcedDraft = undefined
@@ -123,11 +138,11 @@ async function scenario({ initial = 'zh', explicit = 'auto', late = false, brows
   return true
 }
 
-async function mixedClients(artifact) {
+async function mixedClients() {
   let factory
   const timers = new Set(), contexts = []
   const React = { createElement: (type, props, ...children) => ({ type, props: { ...props, children } }) }
-  const source = artifact ? readSource('lib/client.js') : readdirSync(join(root, 'src/client')).filter(name => name.endsWith('.js')).sort().map(name => readSource('src/client/' + name)).join('')
+  const source = readSource('lib/client.js')
   vm.runInNewContext(source, {
     window: { __ModuleLoader__: { load: value => { factory = value.factory } } }, navigator: { language: 'en-US' },
     document: { querySelector: () => ({}), addEventListener() {}, removeEventListener() {}, hidden: false },
@@ -168,21 +183,21 @@ async function mixedClients(artifact) {
     assert.equal(timers.size, 1, 'disposing one client leaves the other polling lifetime intact')
     english.locale.set('en'); await wait()
     assert.equal(snapshot(english).state.config.activeLocale, 'en', 'remaining client still updates after the first disposes')
-    console.log('[ok]', artifact ? 'bundle' : 'source', 'simultaneous mixed-locale clients reuse one module factory independently')
+    console.log('[ok] bundle simultaneous mixed-locale clients reuse one module factory independently')
   } finally {
     for (const ctx of contexts) await ctx.fiber.dispose()
     assert.equal(timers.size, 0, 'both client lifetimes clean up')
   }
 }
 
-for (const artifact of [false, true]) {
-  for (const options of baseline ? [{ initial: 'zh', browser: 'en-US' }] : [
-    { initial: 'zh' }, { initial: 'en', browser: 'zh-CN' },
-    { initial: 'zh', explicit: 'en' }, { initial: 'en', explicit: 'zh' },
-    { initial: 'zh', late: true }, { initial: 'en', late: true, browser: 'zh-CN' },
-    { noService: true, browser: 'en-US' }, { noService: true, browser: 'zh-CN' },
-    { noService: true, browser: 'en-US', metaLocale: 'zh' },
-    { initial: 'fr', browser: 'en-US' }, { initial: 'zh', malformed: true, browser: 'en-US' },
-  ]) { await scenario({ ...options, artifact }); console.log('[ok]', artifact ? 'bundle' : 'source', JSON.stringify(options)) }
-  if (!baseline) await mixedClients(artifact)
-}
+// 旧源码片段已删除:只跑构建产物(lib/client.js + lib/client.<name>.js 分块)。
+// --baseline 改读基线提交的产物(基线提交有 client.js / client.statistics.js,尚无 settings 分块)。
+for (const options of baseline ? [{ initial: 'zh', browser: 'en-US' }] : [
+  { initial: 'zh' }, { initial: 'en', browser: 'zh-CN' },
+  { initial: 'zh', explicit: 'en' }, { initial: 'en', explicit: 'zh' },
+  { initial: 'zh', late: true }, { initial: 'en', late: true, browser: 'zh-CN' },
+  { noService: true, browser: 'en-US' }, { noService: true, browser: 'zh-CN' },
+  { noService: true, browser: 'en-US', metaLocale: 'zh' },
+  { initial: 'fr', browser: 'en-US' }, { initial: 'zh', malformed: true, browser: 'en-US' },
+]) { await scenario(options); console.log('[ok] bundle', JSON.stringify(options)) }
+if (!baseline) await mixedClients()

@@ -26,9 +26,24 @@ export function supportedLocale(value: unknown): 'zh' | 'en' | null {
   return lang === 'zh' || lang === 'en' ? lang : null
 }
 
-/** 解析当前应使用的语言:显式配置 > 浏览器偏好。 */
-export function resolveLocale(config: { activeLocale?: unknown } | null | undefined): 'zh' | 'en' {
-  return supportedLocale(config?.activeLocale) ?? detectBrowserLocale()
+/**
+ * 解析当前应使用的语言,优先级:
+ *   1. 显式配置 `config.locale`(或直接传字符串,旧调用形态)
+ *   2. locale 服务的 `activeLocale`(可带地区后缀)
+ *   3. 浏览器偏好
+ *
+ * 第 1 支必须存在:激活层的 store decorate 会把 `activeLocale` 覆盖成
+ * locale 服务/浏览器语言,这里若不读 `config.locale`,用户在设置里显式选的
+ * 语言会在所有 `makeT(resolveLocale(config))` 处失效(设置分节标签、面板文案、
+ * 统计页标题…)。与旧片段 01 的 1457–1466 行同口径。
+ */
+export function resolveLocale(
+  config: { locale?: unknown; activeLocale?: unknown } | string | null | undefined,
+): 'zh' | 'en' {
+  const value = typeof config === 'string' ? config : config?.locale
+  if (value === 'zh' || value === 'en') return value
+  const active = typeof config === 'string' ? undefined : config?.activeLocale
+  return supportedLocale(active) ?? detectBrowserLocale()
 }
 
 /** 取翻译函数:{name} 占位符替换;缺失键回落 en,再回落键名。 */
