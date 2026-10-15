@@ -40,6 +40,8 @@
  * 以及 store 轮询、RPC api 与全部 slot 注册。
  */
 import React from 'react'
+import { SessionStatisticsButton } from './ui-statistics-entry.js'
+import { CornerChips } from './ui-corner.js'
 import { CONTRIBUTION, makeStore } from './logic.js'
 import { MESSAGES } from './i18n-messages.js'
 import { createStyleTag, detectBrowserLocale, makeT, resolveLocale, supportedLocale, USAGE_POSITION_SWITCHABLE } from './t.js'
@@ -128,10 +130,14 @@ export const inject = ['remote']
 export function registerSlots(slots: any, injected: () => any, runtime: { store: any; CostSection: any; UsagePanel: any }): () => void {
   const { store, CostSection, UsagePanel } = runtime
 
-  // TODO(migrate): 旧实现还在 header/dock 另注册 `SessionStatisticsButton`
-  // (id `cost-meter-statistics`,order 1)。该组件已随设置面板迁到
-  // `client.settings.js`(settings.ts 导出),而启动包不能静态 import 分块,
-  // 故这里暂缺该入口;需要在基座侧把它挪回启动包模块(或拆独立小分块)后补上。
+  // 会话「费用明细」入口:按钮与弹窗外壳在启动包内(ui-statistics-entry.ts),
+  // 弹窗重面板仍按需经 api.loadStatistics() 从 ./client.statistics.js 取。
+  // 注意这条注册不能省 —— 旧单包实现就有它,漏了入口会直接消失。
+  for (const [entryPosition, slotName] of [['header', 'conversation.session.header.actions'], ['dock', 'conversation.composer.dock']] as const) {
+    slots.inject(slotName, () => slots.register(
+      { name: slotName, id: 'cost-meter-statistics', order: 1, inject: () => ({ ...injected(), entryPosition }) },
+      SessionStatisticsButton))
+  }
 
   slots.inject('conversation.chat.turnTail', () => slots.register({ name: 'conversation.chat.turnTail', id: 'cost-meter-turn', order: 10, inject: injected }, TurnCost))
   // 通用插槽注册去重:共享「失效旧注册→bump gen→注入→生成期护栏→记录 dispose→卸载清理」逻辑。
@@ -163,10 +169,9 @@ export function registerSlots(slots: any, injected: () => any, runtime: { store:
   }
   const cornerActive = slotActive()
   const registerCorner = (enabled: boolean) => {
-    // TODO(migrate): 依赖旧片段 1882–1958 行的 `CornerChips`(右下角角标),
-    // 尚未迁移到任何 ui-*.ts;组件落地后在此 registerSlot(cornerActive, ...)。
-    void cornerActive
-    void enabled
+    registerSlot(cornerActive, 'conversation.composer.dock',
+      { name: 'conversation.composer.dock', id: 'cost-meter-corner', order: 9, inject: injected },
+      CornerChips, enabled)
   }
   // 输入框上方额度横条(conversation.input.dock 渲染于输入卡片上方):静态注册,
   // 组件内部按 quotaStrip.enabled 门控,无可用数据时整条隐藏。
