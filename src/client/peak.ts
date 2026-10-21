@@ -46,9 +46,7 @@ const css = [
   '.cm-peak-rail-track .cm-pkw-edge-end{border-top-left-radius:0;border-bottom-left-radius:0;border-top-right-radius:0;border-bottom-right-radius:0;border-bottom-left-radius:999px;border-bottom-right-radius:999px}',
   '.cm-pkw-seg.peak{background:#ff9800}',
   '.cm-pkw-seg.off{background:var(--dsw-alias-state-business-primary)}',
-  // 刻度滑块:空心胶囊——不填充,只留醒目描边(亮色主题近黑、暗色主题近白),
-  // 宽度窄、长度略高于轨道,像滑块轮廓一样扣在分色带上;宽度固定,不改分段比例。
-  '.cm-pkw-cap{position:absolute;top:50%;width:4px;height:calc(100% + 7px);min-height:13px;border-radius:999px;border:1.5px solid var(--cm-pkw-rim);box-sizing:border-box;transform:translate(-50%,-50%);transition:left .4s ease;z-index:2;pointer-events:none}',
+  '.cm-pkw-cap{position:absolute;top:55%;width:3px;height:10px;border-radius:999px;border:1.5px solid var(--cm-pkw-rim);box-sizing:border-box;transform:translate(-50%,-50%);transition:left .4s ease;z-index:2;pointer-events:none;background:var(--cm-pkw-rim)}',
   // 周末/法定假日全天谷价:整条淡显(颜色仍是同一套橙/蓝),文案照常。
   '.cm-peak-strip.weekend .cm-pkw-seg,.cm-peak-rail.wiper.weekend .cm-pkw-rail-seg{opacity:.35}',
   // 窄栏(rail)态:沿用主包 .cm-peak-rail 的外框,只补竖排分段与滑块(比例同宽栏)。
